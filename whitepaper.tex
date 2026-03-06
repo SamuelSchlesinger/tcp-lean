@@ -1,0 +1,90 @@
+\documentclass[11pt]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{hyperref}
+\usepackage[margin=1in]{geometry}
+
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}[section]
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+
+\title{A Formal Verification of TCP (RFC~793) in Lean~4}
+\author{Samuel Schlesinger}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+We present a machine-checked formalization of the Transmission Control
+Protocol as specified in RFC~793. Using the Lean~4 theorem prover, we model
+the TCP state machine, define segment acceptability predicates over modular
+32-bit sequence number arithmetic, and prove correctness properties of
+connection establishment (three-way handshake), graceful teardown, and global
+safety invariants. All theorems are verified by Lean's kernel---if the code
+typechecks, the proofs hold.
+\end{abstract}
+
+\tableofcontents
+
+\section{Introduction}
+\label{sec:introduction}
+
+This work presents a machine-checked formalization of the Transmission Control
+Protocol (TCP) as originally specified by Postel~\cite{rfc793}.
+
+\section{Sequence Numbers}
+\label{sec:seqnum}
+
+% Modular 32-bit arithmetic, the SeqNum type, and comparison relations.
+% Corresponds to \texttt{Tcp.SeqNum}.
+
+\section{Core Types}
+\label{sec:types}
+
+% Port, Socket, Segment header, and TCB structures.
+% Corresponds to \texttt{Tcp.Types}.
+
+\section{State Machine}
+\label{sec:state}
+
+% The eleven TCP states, event types, and the transition function.
+% Corresponds to \texttt{Tcp.State}.
+
+\section{Segment Acceptability}
+\label{sec:acceptability}
+
+% Acceptability predicates for segments and ACKs.
+% Corresponds to \texttt{Tcp.Acceptability}.
+
+\section{Connection Establishment}
+\label{sec:handshake}
+
+% Three-way handshake correctness theorems.
+% Corresponds to \texttt{Tcp.Handshake}.
+
+\section{Connection Teardown}
+\label{sec:teardown}
+
+% Graceful close and TIME-WAIT properties.
+% Corresponds to \texttt{Tcp.Teardown}.
+
+\section{Invariants and Safety Properties}
+\label{sec:invariants}
+
+% Global safety invariants and data delivery guarantees.
+% Corresponds to \texttt{Tcp.Invariants}.
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+% Summary of results, limitations, and future work.
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}

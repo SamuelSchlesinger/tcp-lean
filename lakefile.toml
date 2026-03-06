@@ -1,0 +1,6 @@
+name = "tcp"
+version = "0.1.0"
+defaultTargets = ["Tcp"]
+
+[[lean_lib]]
+name = "Tcp"

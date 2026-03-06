@@ -1,0 +1,13 @@
+/.lake
+
+# LaTeX build artifacts
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
+*.pdf
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
