@@ -5,6 +5,17 @@
 \usepackage{amsmath,amssymb,amsthm}
 \usepackage{hyperref}
 \usepackage[margin=1in]{geometry}
+\usepackage{listings}
+\usepackage{xcolor}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue}\bfseries,
+  commentstyle=\color{gray},
+  breaklines=true,
+  frame=single,
+  language=lean
+}
 
 \theoremstyle{definition}
 \newtheorem{definition}{Definition}[section]
@@ -25,7 +36,9 @@ Protocol as specified in RFC~793. Using the Lean~4 theorem prover, we model
 the TCP state machine, define segment acceptability predicates over modular
 32-bit sequence number arithmetic, and prove correctness properties of
 connection establishment (three-way handshake), graceful teardown, and global
-safety invariants. All theorems are verified by Lean's kernel---if the code
+safety invariants. The formalization uses a two-endpoint system model with an
+explicit network, capturing reordering, loss, and duplication. All theorems
+are verified by Lean's kernel with zero uses of \texttt{sorry}---if the code
 typechecks, the proofs hold.
 \end{abstract}
 
@@ -34,55 +47,333 @@ typechecks, the proofs hold.
 \section{Introduction}
 \label{sec:introduction}
 
-This work presents a machine-checked formalization of the Transmission Control
-Protocol (TCP) as originally specified by Postel~\cite{rfc793}.
+The Transmission Control Protocol (TCP) is the foundation of reliable
+communication on the Internet. Originally specified by Postel~\cite{rfc793},
+TCP provides ordered, reliable, byte-stream delivery over an unreliable
+network. Despite its ubiquity, TCP's specification is given in informal prose,
+and subtle corner cases---simultaneous open, old duplicate SYN recovery,
+half-open connection detection, FIN-with-data---have historically been sources
+of implementation bugs.
+
+This work presents a machine-checked formalization of TCP in Lean~4. Our
+contributions are:
+\begin{enumerate}
+  \item A \textbf{modular sequence number arithmetic} library with a circular
+    less-than relation and proofs of irreflexivity, decidability, and
+    arithmetic interaction properties.
+  \item \textbf{Core type definitions} faithfully modeling RFC~793 segments,
+    the Transmission Control Block (TCB), and the eleven connection states.
+  \item A \textbf{two-endpoint system model} with an explicit network (segment
+    multiset) and a \texttt{SystemStep} inductive type capturing delivery,
+    user calls, timeouts, loss, and duplication.
+  \item The \textbf{full event-processing function} implementing RFC~793
+    \S3.9: all user calls (OPEN, SEND, RECEIVE, CLOSE, ABORT, STATUS), segment
+    arrival in CLOSED, LISTEN, SYN-SENT, and the 8-check pipeline for
+    remaining states, and all three timeout types.
+  \item \textbf{Segment and ACK acceptability} predicates with the four-case
+    table from RFC~793 \S3.3 and lemmas connecting them to TCB invariants.
+  \item \textbf{Handshake correctness}: the three-way handshake reaches
+    ESTABLISHED with synchronized sequence numbers, and RST correctly handles
+    stale connections.
+  \item \textbf{Teardown correctness}: graceful close transitions through the
+    correct states, FIN occupies one sequence number, and TIME-WAIT behaves
+    correctly.
+  \item \textbf{Safety invariants}: no data before ESTABLISHED,
+    \texttt{SND.UNA} $\leq$ \texttt{SND.NXT} preservation across handshake
+    and close, and ACK acceptability preservation.
+\end{enumerate}
+
+All proofs compile with zero uses of \texttt{sorry}. The formalization targets
+Lean~4 v4.28.0 without Mathlib.
 
 \section{Sequence Numbers}
 \label{sec:seqnum}
 
-% Modular 32-bit arithmetic, the SeqNum type, and comparison relations.
-% Corresponds to \texttt{Tcp.SeqNum}.
+TCP sequence numbers are 32-bit unsigned integers with modular arithmetic
+(RFC~793 \S3.3). The key challenge is defining a meaningful ordering: since
+the space wraps around, the standard total order on natural numbers is
+inappropriate.
+
+\begin{definition}[SeqNum]
+A \texttt{SeqNum} is a wrapper over \texttt{UInt32}:
+\begin{lstlisting}
+structure SeqNum where
+  val : UInt32
+\end{lstlisting}
+\end{definition}
+
+\begin{definition}[Circular Less-Than]
+$a < b$ iff $b$ is strictly ahead of $a$ within the forward half-space:
+\begin{lstlisting}
+def lt (a b : SeqNum) : Bool :=
+  let d := b.val - a.val
+  d != 0 && d < halfSpace  -- halfSpace = 2^31
+\end{lstlisting}
+This corresponds to $(b - a) \bmod 2^{32} \in (0, 2^{31})$.
+\end{definition}
+
+\begin{theorem}[Irreflexivity]
+\texttt{SeqNum.lt} is irreflexive: $\forall a,\; \lnot(a < a)$.
+This follows because $a - a = 0$, and the predicate requires $d \neq 0$.
+Proved as \texttt{SeqNum.lt\_irrefl}.
+\end{theorem}
+
+\begin{theorem}[Decidability]
+\texttt{SeqNum.lt} is decidable, with a \texttt{Decidable} instance provided
+for use in \texttt{if} expressions and \texttt{decide} tactics.
+\end{theorem}
+
+We also prove interaction lemmas: \texttt{add\_zero}, \texttt{diff\_self},
+and \texttt{le\_refl}.
 
 \section{Core Types}
 \label{sec:types}
 
-% Port, Socket, Segment header, and TCB structures.
-% Corresponds to \texttt{Tcp.Types}.
+The \texttt{Tcp.Types} module defines the fundamental structures.
+
+\begin{definition}[Segment]
+A TCP segment models the header fields from RFC~793 \S3.1: source/destination
+ports, sequence number, acknowledgment number, control bits (URG, ACK, PSH,
+RST, SYN, FIN), window size, urgent pointer, and payload data. Wire-format
+fields (checksum, data offset, options) are omitted as they concern encoding,
+not protocol logic.
+\end{definition}
+
+\begin{definition}[SEG.LEN]
+Segment length includes data octets plus SYN and FIN contributions to sequence
+space (RFC~793 \S3.3): $\texttt{SEG.LEN} = |\texttt{data}| + \texttt{SYN} +
+\texttt{FIN}$.
+\end{definition}
+
+\begin{definition}[TCB]
+The Transmission Control Block stores all send and receive variables from
+RFC~793 \S3.2: \texttt{SND.UNA}, \texttt{SND.NXT}, \texttt{SND.WND},
+\texttt{SND.UP}, \texttt{SND.WL1}, \texttt{SND.WL2}, \texttt{ISS},
+\texttt{RCV.NXT}, \texttt{RCV.WND}, \texttt{RCV.UP}, and \texttt{IRS}.
+\end{definition}
+
+\begin{definition}[TcpState]
+The eleven TCP states: Closed, Listen, SynSent, SynReceived, Established,
+FinWait1, FinWait2, CloseWait, Closing, LastAck, TimeWait.
+\end{definition}
 
 \section{State Machine}
 \label{sec:state}
 
-% The eleven TCP states, event types, and the transition function.
-% Corresponds to \texttt{Tcp.State}.
+\subsection{Endpoint and System Model}
+
+A \texttt{TcpEndpoint} bundles the connection state, TCB, open mode
+(active/passive), send queue, receive buffer, reassembly buffer,
+retransmission queue, and FIN tracking fields.
+
+The \texttt{System} structure models two communicating endpoints with an
+explicit network:
+\begin{lstlisting}
+structure System where
+  endpointA : TcpEndpoint
+  endpointB : TcpEndpoint
+  network : List Segment
+\end{lstlisting}
+
+The network is treated as an unordered multiset: any segment may be delivered
+next. This is the standard approach in protocol verification.
+
+\subsection{Event Processing}
+
+Event processing follows RFC~793 \S3.9 faithfully:
+
+\begin{itemize}
+  \item \textbf{User calls}: OPEN (active/passive), SEND (segmentize and
+    transmit), RECEIVE (deliver buffered data), CLOSE (send FIN), ABORT
+    (send RST), STATUS.
+  \item \textbf{Segment arrival in CLOSED}: discard data; respond with RST
+    unless the incoming segment is RST.
+  \item \textbf{Segment arrival in LISTEN}: ignore RST; reject ACK with RST;
+    process SYN by sending SYN-ACK and entering SYN-RECEIVED.
+  \item \textbf{Segment arrival in SYN-SENT}: the 5-step pipeline (ACK check,
+    RST check, security, SYN check, drop).
+  \item \textbf{8-check pipeline} for remaining states: (1)~sequence check,
+    (2)~RST, (3)~security (skipped), (4)~SYN, (5)~ACK + window update,
+    (6)~URG, (7)~segment text, (8)~FIN.
+  \item \textbf{Timeouts}: user timeout (abort), retransmission (resend head
+    of queue), TIME-WAIT (close).
+\end{itemize}
+
+\subsection{SystemStep}
+
+The \texttt{SystemStep} inductive relates system states via atomic transitions:
+segment delivery to either endpoint, user calls, timeouts, segment loss, and
+segment duplication. A \texttt{SystemTrace} is the reflexive-transitive closure.
 
 \section{Segment Acceptability}
 \label{sec:acceptability}
 
-% Acceptability predicates for segments and ACKs.
-% Corresponds to \texttt{Tcp.Acceptability}.
+\begin{definition}[Segment Acceptability]
+The four-case table from RFC~793 \S3.3:
+
+\begin{center}
+\begin{tabular}{ccl}
+\textbf{SEG.LEN} & \textbf{RCV.WND} & \textbf{Test} \\
+\hline
+0 & 0 & $\texttt{SEG.SEQ} = \texttt{RCV.NXT}$ \\
+0 & $>0$ & $\texttt{RCV.NXT} \leq \texttt{SEG.SEQ} < \texttt{RCV.NXT} + \texttt{RCV.WND}$ \\
+$>0$ & 0 & not acceptable \\
+$>0$ & $>0$ & start or end of segment in window \\
+\end{tabular}
+\end{center}
+\end{definition}
+
+\begin{definition}[ACK Acceptability]
+Two variants are defined:
+\begin{itemize}
+  \item \textbf{ESTABLISHED+}: $\texttt{SND.UNA} < \texttt{SEG.ACK} \leq
+    \texttt{SND.NXT}$ (strict left inequality---duplicate ACKs excluded).
+  \item \textbf{SYN-RECEIVED}: $\texttt{SND.UNA} \leq \texttt{SEG.ACK} \leq
+    \texttt{SND.NXT}$ (non-strict---allows $\texttt{SEG.ACK} = \texttt{ISS}$).
+\end{itemize}
+\end{definition}
+
+\begin{lemma}[Zero-length, zero-window]
+A zero-length segment with zero window is acceptable iff
+$\texttt{SEG.SEQ} = \texttt{RCV.NXT}$.
+Proved as \texttt{segmentAcceptable\_zero\_zero}.
+\end{lemma}
+
+\begin{lemma}[Data with zero window]
+A data-bearing segment is never acceptable when $\texttt{RCV.WND} = 0$.
+Proved as \texttt{segmentAcceptable\_data\_zeroWnd}.
+\end{lemma}
+
+\begin{lemma}[ACK preserves invariant]
+If an ACK is acceptable (ESTABLISHED-style), advancing \texttt{SND.UNA} to
+\texttt{SEG.ACK} preserves $\texttt{SND.UNA} \leq \texttt{SND.NXT}$.
+Proved as \texttt{ackAcceptable\_preserves\_invariant}.
+\end{lemma}
 
 \section{Connection Establishment}
 \label{sec:handshake}
 
-% Three-way handshake correctness theorems.
-% Corresponds to \texttt{Tcp.Handshake}.
+\begin{theorem}[Three-Way Handshake Correctness]
+Starting from $A = \text{CLOSED}$ and $B = \text{LISTEN}$, after $A$ performs
+active OPEN, the SYN is delivered to $B$, the SYN-ACK is delivered to $A$,
+and the ACK is delivered to $B$: both endpoints reach ESTABLISHED with
+$A.\texttt{tcb.irs} = B.\texttt{tcb.iss}$ and $B.\texttt{tcb.irs} =
+A.\texttt{tcb.iss}$.
+Proved symbolically as \texttt{threeWayHandshake\_correct} for arbitrary ISS
+values, using a two-pass simplification strategy.
+\end{theorem}
+
+\begin{theorem}[SYN Occupies Sequence Space]
+After sending a SYN, $\texttt{SND.NXT} = \texttt{ISS} + 1$.
+Proved symbolically as \texttt{syn\_occupies\_sequence\_space}.
+\end{theorem}
+
+\begin{theorem}[Simultaneous Open]
+When both endpoints perform active OPEN and receive the other's SYN in
+SYN-SENT, each transitions to SYN-RECEIVED (not ESTABLISHED), as expected
+for the first phase of simultaneous open.
+Proved as \texttt{simultaneousOpen\_enters\_synReceived}.
+\end{theorem}
+
+\begin{theorem}[RST Handling]
+A valid RST in SYN-RECEIVED with passive origin returns the endpoint to
+LISTEN. A valid RST in ESTABLISHED aborts the connection.
+Proved as \texttt{rst\_synReceived\_passive\_returns\_to\_listen} and
+\texttt{rst\_established\_aborts}.
+\end{theorem}
 
 \section{Connection Teardown}
 \label{sec:teardown}
 
-% Graceful close and TIME-WAIT properties.
-% Corresponds to \texttt{Tcp.Teardown}.
+\begin{theorem}[CLOSE from ESTABLISHED]
+CLOSE from ESTABLISHED transitions to FIN-WAIT-1, emits a FIN segment, and
+advances $\texttt{SND.NXT}$ by 1 (FIN occupies one sequence number).
+Proved as \texttt{close\_established\_enters\_finWait1} and
+\texttt{fin\_occupies\_sequence\_space}.
+\end{theorem}
+
+\begin{theorem}[CLOSE-WAIT $\to$ LAST-ACK]
+CLOSE from CLOSE-WAIT enters LAST-ACK (not CLOSING). The RFC~793 \S3.9 text
+says ``enter CLOSING state'' but Figure~6 (the state diagram) shows
+CLOSE-WAIT $\to$ LAST-ACK. We follow Figure~6 as authoritative.
+Proved as \texttt{close\_closeWait\_enters\_lastAck}.
+\end{theorem}
+
+\begin{theorem}[TIME-WAIT Behavior]
+TIME-WAIT timeout transitions to CLOSED. RST in TIME-WAIT causes immediate
+transition to CLOSED.
+Proved as \texttt{timeWait\_timeout\_closes} and
+\texttt{rst\_timeWait\_closes}.
+\end{theorem}
 
 \section{Invariants and Safety Properties}
 \label{sec:invariants}
 
-% Global safety invariants and data delivery guarantees.
-% Corresponds to \texttt{Tcp.Invariants}.
+\begin{theorem}[No Data Before ESTABLISHED]
+In CLOSED, LISTEN, SYN-SENT, and SYN-RECEIVED states, the RECEIVE call never
+returns data to the user. Data piggybacked on SYN segments is buffered in the
+reassembly buffer and not delivered until the connection reaches ESTABLISHED.
+Proved as \texttt{no\_data\_in\_closed}, \texttt{no\_data\_in\_listen},
+\texttt{no\_data\_in\_synSent}, \texttt{no\_data\_in\_synReceived}.
+\end{theorem}
+
+\begin{theorem}[Sequence Number Monotonicity]
+$\texttt{SND.UNA} \leq \texttt{SND.NXT}$ is preserved by every processing
+function. Per-function preservation theorems are proved symbolically:
+\texttt{processOpen\_preserves}, \texttt{processSegment\_preserves},
+\texttt{processClose\_preserves}, \texttt{processSend\_preserves},
+\texttt{processTimeout\_preserves}, etc.
+\end{theorem}
+
+\begin{theorem}[ACK Acceptability Preserves Monotonicity]
+If an ACK is acceptable (ESTABLISHED-style), advancing $\texttt{SND.UNA}$ to
+$\texttt{SEG.ACK}$ maintains $\texttt{SND.UNA} \leq \texttt{SND.NXT}$.
+This is the key lemma for proving monotonicity inductively over system traces.
+Proved as \texttt{ackAdvanceTcb\_preserves}.
+\end{theorem}
+
+\begin{theorem}[SystemStep Invariant]
+The system invariant $\texttt{SND.UNA} \leq \texttt{SND.NXT}$ on both
+endpoints is preserved by every \texttt{SystemStep} transition. For segment
+delivery, timeout, and abort steps, preservation is unconditional. For user
+SEND/CLOSE calls, the proof requires that sequence number advancement stays
+in the forward half-space (guaranteed in real TCP by the send window per
+RFC~793 \S3.7). Proved as \texttt{systemStep\_preserves\_invariant}.
+\end{theorem}
 
 \section{Conclusion}
 \label{sec:conclusion}
 
-% Summary of results, limitations, and future work.
+We have presented a machine-checked formalization of TCP (RFC~793) in Lean~4,
+covering modular sequence number arithmetic, the full event-processing state
+machine, segment acceptability, connection establishment, graceful teardown,
+and safety invariants. All proofs compile with zero \texttt{sorry}.
+
+\subsection{Design Decisions}
+
+Key modeling choices include: representing sequence numbers as \texttt{UInt32}
+wrappers with a circular half-space comparison; using a two-endpoint system
+model with an explicit segment network; implementing event processing as pure
+functions with nondeterminism confined to the \texttt{SystemStep} inductive;
+and omitting security/precedence checks (RFC~793 \S3.6) as orthogonal
+IP-layer concerns.
+
+\subsection{Limitations}
+
+This formalization intentionally excludes several RFC~793 features:
+security/compartment/precedence (\S3.6), checksum computation, MSS option
+negotiation, ISN clock-based generation (\S3.3), RTO calculation (\S3.7),
+and IP-layer interactions. The \texttt{SystemStep} invariant proof for user
+SEND/CLOSE calls relies on a blanket hypothesis that sequence number
+advancement stays within the forward half-space, rather than deriving this
+from send window bounds.
+
+\subsection{Future Work}
+
+Natural extensions include: full inductive invariant proofs over
+\texttt{SystemStep}; congestion control (RFC~5681); window scaling and
+timestamps (RFC~7323); and modeling of the full simultaneous open handshake
+completion through SYN-RECEIVED to ESTABLISHED.
 
 \bibliographystyle{plain}
 \bibliography{references}
