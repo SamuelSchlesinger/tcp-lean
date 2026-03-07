@@ -607,25 +607,43 @@ def pipelineAck (ep : TcpEndpoint) (seg : Segment) : Option TcpEndpoint :=
     else
       some ep  -- duplicate ACK
   | .FinWait1 =>
-    let ep' := ackUpdate ep seg
-    let finAcked := match ep.finSeqNum with
-      | some fseq => SeqNum.lt fseq seg.ackNum
-      | none => false
-    let newState := if finAcked then TcpState.FinWait2 else TcpState.FinWait1
-    some { ep' with state := newState }
-  | .FinWait2 =>
-    some (ackUpdate ep seg)
-  | .CloseWait =>
-    some (ackUpdate ep seg)
-  | .Closing =>
-    -- RFC 793 §3.9: "if the ACK acknowledges our FIN then enter TIME-WAIT"
-    let finAcked := match ep.finSeqNum with
-      | some fseq => SeqNum.lt fseq seg.ackNum
-      | none => false
-    if finAcked then
-      some { ep with state := .TimeWait }
+    -- RFC 793 §3.9: "In addition to the processing for the ESTABLISHED state"
+    if SeqNum.lt ep.tcb.sndNxt seg.ackNum then
+      none  -- future ACK: send ACK, drop segment
     else
-      some ep
+      let ep' := ackUpdate ep seg
+      let finAcked := match ep.finSeqNum with
+        | some fseq => SeqNum.lt fseq seg.ackNum
+        | none => false
+      let newState := if finAcked then TcpState.FinWait2 else TcpState.FinWait1
+      some { ep' with state := newState }
+  | .FinWait2 =>
+    -- RFC 793 §3.9: "In addition to the processing for the ESTABLISHED state"
+    if SeqNum.lt ep.tcb.sndNxt seg.ackNum then
+      none  -- future ACK
+    else
+      some (ackUpdate ep seg)
+  | .CloseWait =>
+    -- RFC 793 §3.9: "Do the same processing as for the ESTABLISHED state."
+    if SeqNum.lt ep.tcb.sndNxt seg.ackNum then
+      none  -- future ACK
+    else
+      some (ackUpdate ep seg)
+  | .Closing =>
+    -- RFC 793 §3.9: "In addition to the processing for the ESTABLISHED state,
+    -- if the ACK acknowledges our FIN then enter the TIME-WAIT state,
+    -- otherwise ignore the segment."
+    if SeqNum.lt ep.tcb.sndNxt seg.ackNum then
+      none  -- future ACK
+    else
+      let ep' := ackUpdate ep seg
+      let finAcked := match ep.finSeqNum with
+        | some fseq => SeqNum.lt fseq seg.ackNum
+        | none => false
+      if finAcked then
+        some { ep' with state := .TimeWait }
+      else
+        some ep'  -- RFC says "ignore the segment" but ackUpdate already applied
   | .LastAck =>
     -- RFC 793 §3.9: "if our FIN is now acknowledged, delete TCB, enter CLOSED"
     let finAcked := match ep.finSeqNum with

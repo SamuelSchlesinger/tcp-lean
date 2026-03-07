@@ -267,20 +267,35 @@ theorem pipelineAck_preserves (ep : TcpEndpoint) (seg : Segment)
     · split at hAck
       · simp at hAck
       · simp at hAck; rw [← hAck]; exact h
-  · -- FinWait1: ackUpdate, then state change
-    simp at hAck; rw [← hAck]
-    unfold ackUpdate
-    simp [windowUpdateTcb_sndUna, windowUpdateTcb_sndNxt]
-    rw [← ackAdvanceTcb_sndNxt ep.tcb seg]
-    exact ackAdvanceTcb_preserves ep.tcb seg h
-  · -- FinWait2
-    simp at hAck; rw [← hAck]; exact ackUpdate_preserves _ _ h
-  · -- CloseWait
-    simp at hAck; rw [← hAck]; exact ackUpdate_preserves _ _ h
-  · -- Closing
+  · -- FinWait1: future ACK guard, then ackUpdate + state change
     split at hAck
-    · split at hAck <;> simp at hAck <;> rw [← hAck] <;> exact h
-    · simp at hAck; rw [← hAck]; exact h
+    · simp at hAck  -- future ACK → none, contradicts some ep'
+    · simp at hAck; rw [← hAck]
+      unfold ackUpdate
+      simp [windowUpdateTcb_sndUna, windowUpdateTcb_sndNxt]
+      rw [← ackAdvanceTcb_sndNxt ep.tcb seg]
+      exact ackAdvanceTcb_preserves ep.tcb seg h
+  · -- FinWait2: future ACK guard, then ackUpdate
+    split at hAck
+    · simp at hAck
+    · simp at hAck; rw [← hAck]; exact ackUpdate_preserves _ _ h
+  · -- CloseWait: future ACK guard, then ackUpdate
+    split at hAck
+    · simp at hAck
+    · simp at hAck; rw [← hAck]; exact ackUpdate_preserves _ _ h
+  · -- Closing: future ACK guard, then ackUpdate + FIN check
+    split at hAck
+    · simp at hAck  -- future ACK → none
+    · -- else branch: split on finAcked
+      split at hAck
+      -- ep.finSeqNum = some fseq: split on fseq.lt seg.ackNum
+      · split at hAck <;> simp at hAck <;> rw [← hAck]
+        · -- finAcked: ep' with state TimeWait, tcb from ackUpdate
+          simp only [ackUpdate, windowUpdateTcb_sndUna, windowUpdateTcb_sndNxt]
+          exact ackAdvanceTcb_preserves ep.tcb seg h
+        · exact ackUpdate_preserves _ _ h
+      -- ep.finSeqNum = none: finAcked = false, ep' = ackUpdate ep seg
+      · simp at hAck; rw [← hAck]; exact ackUpdate_preserves _ _ h
   · -- LastAck
     split at hAck
     · split at hAck <;> simp at hAck <;> rw [← hAck]

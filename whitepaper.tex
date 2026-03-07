@@ -358,7 +358,7 @@ functions with nondeterminism confined to the \texttt{SystemStep} inductive;
 and omitting security/precedence checks (RFC~793 \S3.6) as orthogonal
 IP-layer concerns.
 
-\subsection{Limitations}
+\subsection{Limitations and Known Deviations}
 
 This formalization intentionally excludes several RFC~793 features:
 security/compartment/precedence (\S3.6), checksum computation, MSS option
@@ -368,12 +368,29 @@ SEND/CLOSE calls relies on a blanket hypothesis that sequence number
 advancement stays within the forward half-space, rather than deriving this
 from send window bounds.
 
+Known deviations from RFC~793:
+\begin{itemize}
+  \item \textbf{CLOSE-WAIT $+$ CLOSE}: the \S3.9 text says ``enter CLOSING
+    state'' but Figure~6 (the state diagram) shows CLOSE-WAIT $\to$ LAST-ACK.
+    We follow Figure~6 as authoritative. This is a known errata in RFC~793.
+  \item \textbf{Urgent pointer interpretation}: RFC~793 \S3.9 says
+    \texttt{RCV.UP <- max(RCV.UP, SEG.UP)}, where \texttt{SEG.UP} is defined
+    as a positive offset from \texttt{SEG.SEQ}. We interpret this as
+    \texttt{RCV.UP <- max(RCV.UP, RCV.NXT + SEG.UP)}, converting the offset
+    to a sequence number. This is consistent with the idealized segment
+    assumption (\texttt{SEG.SEQ = RCV.NXT}) and is a known RFC ambiguity.
+  \item \textbf{No timer state}: the formalization does not model the
+    retransmission timer, 2$\times$MSL timer, or user timeout timer as
+    explicit state. Timeouts are modeled as nondeterministic events via
+    \texttt{SystemStep}.
+\end{itemize}
+
 \subsection{Future Work}
 
-Natural extensions include: full inductive invariant proofs over
-\texttt{SystemStep}; congestion control (RFC~5681); window scaling and
-timestamps (RFC~7323); and modeling of the full simultaneous open handshake
-completion through SYN-RECEIVED to ESTABLISHED.
+Natural extensions include: congestion control (RFC~5681); window scaling and
+timestamps (RFC~7323); modeling of the full simultaneous open handshake
+completion through SYN-RECEIVED to ESTABLISHED; and deriving the
+SEND/CLOSE half-space hypothesis from send window bounds.
 
 \bibliographystyle{plain}
 \bibliography{references}
