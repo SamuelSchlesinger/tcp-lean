@@ -65,7 +65,7 @@ structure Segment where
   window  : UInt16
   urgPtr  : UInt16 := 0
   data    : List UInt8 := []
-deriving Repr
+deriving Repr, BEq
 
 instance : Inhabited Segment where
   default := { srcPort := 0, dstPort := 0, seq := ⟨0⟩, ackNum := ⟨0⟩, window := 0 }

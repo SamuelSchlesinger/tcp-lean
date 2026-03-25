@@ -174,14 +174,23 @@ def processOpen (ep : TcpEndpoint) (mode : OpenMode) (iss : SeqNum)
 /-- Segmentize data from the send queue into segments, respecting the send
     window. Returns updated endpoint and list of segments to emit. -/
 def segmentize (ep : TcpEndpoint) : TcpEndpoint × List Segment :=
-  if ep.sendQueue.isEmpty then (ep, [])
+  -- Compute usable window: SND.WND - (SND.NXT - SND.UNA), capped at 0
+  -- RFC 793 §3.7: "the sending TCP must be prepared to accept ... the
+  -- send window ... to determine how much it can transmit."
+  let inflight : UInt32 := ep.tcb.sndNxt.val - ep.tcb.sndUna.val
+  let window : UInt32 := ep.tcb.sndWnd.toUInt32
+  let available : Nat :=
+    if inflight >= window then 0
+    else min ep.sendQueue.length (window - inflight).toNat
+  if available == 0 then (ep, [])
   else
+    let dataToSend := ep.sendQueue.take available
     let seg := mkSegment ep.tcb.sndNxt ep.tcb.rcvNxt
-      { ack := true } ep.tcb.rcvWnd ep.sendQueue
-    let newNxt := ep.tcb.sndNxt.add ep.sendQueue.length.toUInt32
+      { ack := true } ep.tcb.rcvWnd dataToSend
+    let newNxt := ep.tcb.sndNxt.add dataToSend.length.toUInt32
     let ep' := { ep with
       tcb := { ep.tcb with sndNxt := newNxt }
-      sendQueue := []
+      sendQueue := ep.sendQueue.drop available
       retxQueue := ep.retxQueue ++ [seg] }
     (ep', [seg])
 
@@ -395,6 +404,87 @@ def processSegmentListen (ep : TcpEndpoint) (seg : Segment) (iss : SeqNum)
     { endpoint := ep }
 
 -- ============================================================================
+-- Pipeline Steps 6-8: Post-ACK Processing
+-- ============================================================================
+
+/-- Step 6: URG check. Updates RCV.UP if URG bit set.
+    RFC 793 §3.9 sixth check. Only processed in ESTABLISHED, FIN-WAIT-1/2. -/
+def pipelineUrg (ep : TcpEndpoint) (seg : Segment) : TcpEndpoint :=
+  match ep.state with
+  | .Established | .FinWait1 | .FinWait2 =>
+    if seg.ctl.urg then
+      let newUp := if SeqNum.lt ep.tcb.rcvUp (ep.tcb.rcvNxt.add seg.urgPtr.toUInt32) then
+        ep.tcb.rcvNxt.add seg.urgPtr.toUInt32
+      else ep.tcb.rcvUp
+      { ep with tcb := { ep.tcb with rcvUp := newUp } }
+    else ep
+  | _ => ep
+
+@[simp]
+theorem pipelineUrg_state (ep : TcpEndpoint) (seg : Segment) :
+    (pipelineUrg ep seg).state = ep.state := by
+  simp only [pipelineUrg]; split <;> (try split) <;> simp_all
+
+/-- Step 7: Segment text processing. Buffers data and advances RCV.NXT.
+    RFC 793 §3.9 seventh check. Only in ESTABLISHED, FIN-WAIT-1/2. -/
+def pipelineText (ep : TcpEndpoint) (seg : Segment) : TcpEndpoint × Bool :=
+  match ep.state with
+  | .Established | .FinWait1 | .FinWait2 =>
+    if !seg.data.isEmpty then
+      let newRcvNxt := ep.tcb.rcvNxt.add seg.data.length.toUInt32
+      ({ ep with
+        tcb := { ep.tcb with rcvNxt := newRcvNxt }
+        recvBuffer := ep.recvBuffer ++ seg.data }, true)
+    else (ep, false)
+  | _ => (ep, false)
+
+@[simp]
+theorem pipelineText_state (ep : TcpEndpoint) (seg : Segment) :
+    (pipelineText ep seg).1.state = ep.state := by
+  simp only [pipelineText]; split <;> (try split) <;> simp_all
+
+/-- Step 8: FIN check. Advances RCV.NXT over the FIN and transitions state.
+    RFC 793 §3.9 eighth check: "If the FIN bit is set..." -/
+def pipelineFin (ep : TcpEndpoint) (seg : Segment) (needAck : Bool) : ProcessResult :=
+  if seg.ctl.fin then
+    let newRcvNxt := ep.tcb.rcvNxt.add 1
+    let ep' := { ep with tcb := { ep.tcb with rcvNxt := newRcvNxt } }
+    let ackSeg := mkSegment ep'.tcb.sndNxt newRcvNxt { ack := true } ep'.tcb.rcvWnd
+    match ep'.state with
+    | .SynReceived | .Established =>
+      { endpoint := { ep' with state := .CloseWait }
+        segments := [ackSeg] }
+    | .FinWait1 =>
+      let finAcked := match ep'.finSeqNum with
+        | some fseq => SeqNum.lt fseq seg.ackNum
+        | none => false
+      if finAcked then
+        { endpoint := { ep' with state := .TimeWait }
+          segments := [ackSeg] }
+      else
+        { endpoint := { ep' with state := .Closing }
+          segments := [ackSeg] }
+    | .FinWait2 =>
+      { endpoint := { ep' with state := .TimeWait }
+        segments := [ackSeg] }
+    | _ =>
+      -- CLOSE-WAIT, CLOSING, LAST-ACK, TIME-WAIT: remain in state
+      { endpoint := ep', segments := [ackSeg] }
+  else
+    if needAck then
+      let ackSeg := mkSegment ep.tcb.sndNxt ep.tcb.rcvNxt { ack := true } ep.tcb.rcvWnd
+      { endpoint := ep, segments := [ackSeg] }
+    else
+      { endpoint := ep }
+
+/-- Steps 6-8 composed: URG check, segment text, FIN check.
+    RFC 793 §3.9 sixth, seventh, eighth checks. -/
+def pipelinePostAck (ep : TcpEndpoint) (seg : Segment) : ProcessResult :=
+  let ep' := pipelineUrg ep seg
+  let (ep', needAck) := pipelineText ep' seg
+  pipelineFin ep' seg needAck
+
+-- ============================================================================
 -- SEGMENT ARRIVES — SYN-SENT State — RFC 793 §3.9
 -- ============================================================================
 
@@ -451,18 +541,14 @@ def processSegmentSynSent (ep : TcpEndpoint) (seg : Segment) : ProcessResult :=
         -- RFC 793 §3.9 SYN-SENT fourth check: "if the segment contains
         -- additional data or controls, continue processing at the sixth
         -- step below where the URG bit is checked"
-        -- Process data on the SYN-ACK (step 7: segment text)
-        let recvBuf := if seg.data.isEmpty then ep.recvBuffer
-                       else ep.recvBuffer ++ seg.data
-        let tcb3 : Tcb := if !seg.data.isEmpty then
-          { tcb2 with rcvNxt := rcvNxt.add seg.data.length.toUInt32 }
-        else tcb2
-        { endpoint := { ep with
+        let epEst : TcpEndpoint := { ep with
             state := .Established
-            tcb := tcb3
-            openMode := ep.openMode
-            recvBuffer := recvBuf }
-          segments := [ackSeg] }
+            tcb := tcb2
+            openMode := ep.openMode }
+        -- Route through steps 6-8 (URG, text, FIN) per RFC
+        let postAck := pipelinePostAck epEst seg
+        { endpoint := postAck.endpoint
+          segments := [ackSeg] ++ postAck.segments }
       else
         -- Simultaneous open → SYN-RECEIVED
         let synAck := mkSegment ep.tcb.iss rcvNxt { syn := true, ack := true } defaultRcvWnd
@@ -600,12 +686,12 @@ def pipelineAck (ep : TcpEndpoint) (seg : Segment) : Option TcpEndpoint :=
       none
   | .Established =>
     -- RFC 793 §3.9: "If SND.UNA < SEG.ACK =< SND.NXT then, set SND.UNA <- SEG.ACK"
-    if SeqNum.lt ep.tcb.sndUna seg.ackNum && SeqNum.le seg.ackNum ep.tcb.sndNxt then
-      some (ackUpdate ep seg)
-    else if SeqNum.lt ep.tcb.sndNxt seg.ackNum then
-      none  -- future ACK
+    -- ackAdvanceTcb is self-guarding (no-op for duplicate ACKs).
+    -- Window update (windowUpdateTcb) must still run for duplicate ACKs per RFC.
+    if SeqNum.lt ep.tcb.sndNxt seg.ackNum then
+      none  -- future ACK: send ACK, drop segment
     else
-      some ep  -- duplicate ACK
+      some (ackUpdate ep seg)
   | .FinWait1 =>
     -- RFC 793 §3.9: "In addition to the processing for the ESTABLISHED state"
     if SeqNum.lt ep.tcb.sndNxt seg.ackNum then
@@ -668,99 +754,6 @@ def pipelineAckReject (ep : TcpEndpoint) (seg : Segment) : ProcessResult :=
   | _ =>
     let ackSeg := mkSegment ep.tcb.sndNxt ep.tcb.rcvNxt { ack := true } ep.tcb.rcvWnd
     { endpoint := ep, segments := [ackSeg] }
-
--- ============================================================================
--- Pipeline Step 6: URG Check
--- ============================================================================
-
-/-- Step 6: URG check. Updates RCV.UP if URG bit set.
-    RFC 793 §3.9 sixth check. Only processed in ESTABLISHED, FIN-WAIT-1/2. -/
-def pipelineUrg (ep : TcpEndpoint) (seg : Segment) : TcpEndpoint :=
-  match ep.state with
-  | .Established | .FinWait1 | .FinWait2 =>
-    if seg.ctl.urg then
-      let newUp := if SeqNum.lt ep.tcb.rcvUp (ep.tcb.rcvNxt.add seg.urgPtr.toUInt32) then
-        ep.tcb.rcvNxt.add seg.urgPtr.toUInt32
-      else ep.tcb.rcvUp
-      { ep with tcb := { ep.tcb with rcvUp := newUp } }
-    else ep
-  | _ => ep
-
-@[simp]
-theorem pipelineUrg_state (ep : TcpEndpoint) (seg : Segment) :
-    (pipelineUrg ep seg).state = ep.state := by
-  simp only [pipelineUrg]; split <;> (try split) <;> simp_all
-
--- ============================================================================
--- Pipeline Step 7: Segment Text
--- ============================================================================
-
-/-- Step 7: Segment text processing. Buffers data and advances RCV.NXT.
-    RFC 793 §3.9 seventh check. Only in ESTABLISHED, FIN-WAIT-1/2. -/
-def pipelineText (ep : TcpEndpoint) (seg : Segment) : TcpEndpoint × Bool :=
-  match ep.state with
-  | .Established | .FinWait1 | .FinWait2 =>
-    if !seg.data.isEmpty then
-      let newRcvNxt := ep.tcb.rcvNxt.add seg.data.length.toUInt32
-      ({ ep with
-        tcb := { ep.tcb with rcvNxt := newRcvNxt }
-        recvBuffer := ep.recvBuffer ++ seg.data }, true)
-    else (ep, false)
-  | _ => (ep, false)
-
-@[simp]
-theorem pipelineText_state (ep : TcpEndpoint) (seg : Segment) :
-    (pipelineText ep seg).1.state = ep.state := by
-  simp only [pipelineText]; split <;> (try split) <;> simp_all
-
--- ============================================================================
--- Pipeline Step 8: FIN Check
--- ============================================================================
-
-/-- Step 8: FIN check. Advances RCV.NXT over the FIN and transitions state.
-    RFC 793 §3.9 eighth check: "If the FIN bit is set..." -/
-def pipelineFin (ep : TcpEndpoint) (seg : Segment) (needAck : Bool) : ProcessResult :=
-  if seg.ctl.fin then
-    let newRcvNxt := ep.tcb.rcvNxt.add 1
-    let ep' := { ep with tcb := { ep.tcb with rcvNxt := newRcvNxt } }
-    let ackSeg := mkSegment ep'.tcb.sndNxt newRcvNxt { ack := true } ep'.tcb.rcvWnd
-    match ep'.state with
-    | .SynReceived | .Established =>
-      { endpoint := { ep' with state := .CloseWait }
-        segments := [ackSeg] }
-    | .FinWait1 =>
-      let finAcked := match ep'.finSeqNum with
-        | some fseq => SeqNum.lt fseq seg.ackNum
-        | none => false
-      if finAcked then
-        { endpoint := { ep' with state := .TimeWait }
-          segments := [ackSeg] }
-      else
-        { endpoint := { ep' with state := .Closing }
-          segments := [ackSeg] }
-    | .FinWait2 =>
-      { endpoint := { ep' with state := .TimeWait }
-        segments := [ackSeg] }
-    | _ =>
-      -- CLOSE-WAIT, CLOSING, LAST-ACK, TIME-WAIT: remain in state
-      { endpoint := ep', segments := [ackSeg] }
-  else
-    if needAck then
-      let ackSeg := mkSegment ep.tcb.sndNxt ep.tcb.rcvNxt { ack := true } ep.tcb.rcvWnd
-      { endpoint := ep, segments := [ackSeg] }
-    else
-      { endpoint := ep }
-
--- ============================================================================
--- Pipeline Steps 6-8: Post-ACK Processing (Composed)
--- ============================================================================
-
-/-- Steps 6-8 composed: URG check, segment text, FIN check.
-    RFC 793 §3.9 sixth, seventh, eighth checks. -/
-def pipelinePostAck (ep : TcpEndpoint) (seg : Segment) : ProcessResult :=
-  let ep' := pipelineUrg ep seg
-  let (ep', needAck) := pipelineText ep' seg
-  pipelineFin ep' seg needAck
 
 -- ============================================================================
 -- Composed Pipeline
@@ -842,23 +835,23 @@ def processTimeout (ep : TcpEndpoint) (kind : TimeoutKind) : ProcessResult :=
     Each step advances the system by exactly one action. -/
 inductive SystemStep : System → System → Prop where
   /-- Deliver a segment from the network to endpoint A. -/
-  | deliverToA (s : System) (seg : Segment) (rest : List Segment)
-    (h_net : s.network = seg :: rest ∨ seg ∈ s.network)
+  | deliverToA (s : System) (seg : Segment)
+    (h_mem : seg ∈ s.network)
     (result : ProcessResult)
     (h_proc : processSegment s.endpointA seg = result) :
     SystemStep s {
       endpointA := result.endpoint
       endpointB := s.endpointB
-      network := rest ++ result.segments }
+      network := s.network.erase seg ++ result.segments }
   /-- Deliver a segment from the network to endpoint B. -/
-  | deliverToB (s : System) (seg : Segment) (rest : List Segment)
-    (h_net : s.network = seg :: rest ∨ seg ∈ s.network)
+  | deliverToB (s : System) (seg : Segment)
+    (h_mem : seg ∈ s.network)
     (result : ProcessResult)
     (h_proc : processSegment s.endpointB seg = result) :
     SystemStep s {
       endpointA := s.endpointA
       endpointB := result.endpoint
-      network := rest ++ result.segments }
+      network := s.network.erase seg ++ result.segments }
   /-- A user call on endpoint A. -/
   | userCallA (s : System) (call : UserCall)
     (result : ProcessResult)
@@ -892,9 +885,9 @@ inductive SystemStep : System → System → Prop where
       endpointB := result.endpoint
       network := s.network ++ result.segments }
   /-- Segment loss: remove a segment from the network without delivery. -/
-  | segmentLoss (s : System) (seg : Segment) (rest : List Segment)
-    (h_net : s.network = seg :: rest ∨ seg ∈ s.network) :
-    SystemStep s { s with network := rest }
+  | segmentLoss (s : System) (seg : Segment)
+    (h_mem : seg ∈ s.network) :
+    SystemStep s { s with network := s.network.erase seg }
   /-- Segment duplication: copy a segment in the network. -/
   | segmentDup (s : System) (seg : Segment)
     (h_mem : seg ∈ s.network) :

@@ -139,59 +139,142 @@ theorem processSegmentListen_preserves (ep : TcpEndpoint) (seg : Segment)
       · exact h
 
 -- ============================================================================
+-- Helper: SeqNum.le is preserved by add when the sum stays in half-space
+-- ============================================================================
+
+/-- If `una ≤ nxt` (half-space) and `(nxt - una) + n < halfSpace`, then `una ≤ nxt + n`. -/
+theorem SeqNum.le_add_of_le (una nxt : SeqNum) (n : UInt32)
+    (h : SeqNum.le una nxt = true)
+    (hn : (nxt.val - una.val) + n < SeqNum.halfSpace) :
+    SeqNum.le una (nxt.add n) = true := by
+  simp only [SeqNum.le, SeqNum.lt, SeqNum.add, SeqNum.halfSpace,
+    Bool.or_eq_true, Bool.and_eq_true, beq_iff_eq, bne_iff_ne, ne_eq,
+    decide_eq_true_eq] at *
+  bv_decide
+
+/-- Window-bounded add preserves le: if `una ≤ nxt`, inflight < window (UInt16),
+    and n ≤ remaining window, then `una ≤ nxt + n`. The UInt16 window ensures
+    the sum stays well within the half-space. -/
+theorem SeqNum.le_add_within_window (una nxt : SeqNum) (w : UInt16) (n : UInt32)
+    (h : SeqNum.le una nxt = true)
+    (hLt : nxt.val - una.val < w.toUInt32)
+    (hN : n ≤ w.toUInt32 - (nxt.val - una.val)) :
+    SeqNum.le una (nxt.add n) = true := by
+  simp only [SeqNum.le, SeqNum.lt, SeqNum.add, SeqNum.halfSpace,
+    Bool.or_eq_true, Bool.and_eq_true, beq_iff_eq, bne_iff_ne, ne_eq,
+    decide_eq_true_eq] at *
+  bv_decide
+
+/-- Nat-to-UInt32 order preservation: if k ≤ m.toNat, then UInt32.ofNat k ≤ m. -/
+theorem UInt32_ofNat_le (k : Nat) (m : UInt32) (h : k ≤ m.toNat) :
+    UInt32.ofNat k ≤ m := by
+  show (UInt32.ofNat k).toBitVec ≤ m.toBitVec
+  show (UInt32.ofNat k).toBitVec.toNat ≤ m.toBitVec.toNat
+  have hm : m.toBitVec.toNat < 2^32 := m.toBitVec.isLt
+  have hk : k < 2^32 := Nat.lt_of_le_of_lt h hm
+  simp only [UInt32.ofNat, UInt32.toNat] at *
+  rw [BitVec.toNat_ofNat, Nat.mod_eq_of_lt hk]
+  exact h
+
+/-- inflight ≤ window (UInt16) implies inflight + 1 < halfSpace. -/
+private theorem window_plus_one_lt_halfSpace (a : UInt32) (w : UInt16)
+    (h : a ≤ w.toUInt32) : a + 1 < SeqNum.halfSpace := by
+  simp only [SeqNum.halfSpace]; bv_decide
+
+/-- inflight + sent + 1 < halfSpace when sent is within the window. -/
+private theorem inflight_sent_fin_lt_halfSpace (inflight n : UInt32) (w : UInt16)
+    (h1 : inflight < w.toUInt32) (h2 : n ≤ w.toUInt32 - inflight) :
+    inflight + (n + 1) < SeqNum.halfSpace := by
+  simp only [SeqNum.halfSpace]
+  have : inflight + (n + 1) = inflight + n + 1 := by
+    apply UInt32.eq_of_toBitVec_eq; simp [UInt32.toBitVec_add]; ac_rfl
+  rw [this]; bv_decide
+
+-- ============================================================================
 -- Segmentize / Send / Close — need queue bounds
 -- ============================================================================
 
 @[simp] theorem segmentize_sndUna (ep : TcpEndpoint) :
     (segmentize ep).1.tcb.sndUna = ep.tcb.sndUna := by
-  simp only [segmentize]; split <;> simp_all
+  simp only [segmentize]; split <;> (try split) <;> simp_all
 
 theorem segmentize_preserves (ep : TcpEndpoint)
-    (h : endpointInvariant ep)
-    (hBound : SeqNum.le ep.tcb.sndUna
-      (ep.tcb.sndNxt.add ep.sendQueue.length.toUInt32) = true) :
+    (h : endpointInvariant ep) :
     endpointInvariant (segmentize ep).1 := by
   simp only [endpointInvariant, segmentize]
   split
-  · exact h
-  · simp_all
+  · simp_all [endpointInvariant]  -- inflight >= window → available = 0 → (ep, [])
+  · rename_i h_inflight
+    split
+    · exact h  -- available == 0
+    · -- Send case: need sndUna ≤ sndNxt + n
+      dsimp only []
+      apply SeqNum.le_add_within_window _ _ ep.tcb.sndWnd _ h
+        (Nat.lt_of_not_le h_inflight)
+      apply UInt32_ofNat_le
+      simp [List.length_take]
+      omega
 
 theorem processSend_preserves (ep : TcpEndpoint) (data : List UInt8)
-    (h : endpointInvariant ep)
-    (hBound : SeqNum.le ep.tcb.sndUna
-      (ep.tcb.sndNxt.add (ep.sendQueue ++ data).length.toUInt32) = true) :
+    (h : endpointInvariant ep) :
     endpointInvariant (processSend ep data).endpoint := by
-  cases hState : ep.state <;>
-    simp only [endpointInvariant, processSend, hState, segmentize] <;>
-    first | exact h | (split <;> simp_all)
+  simp only [processSend]
+  split
+  all_goals (try exact h)
+  -- Established and CloseWait: endpoint is (segmentize ep').1 where ep' has same tcb
+  all_goals
+    show endpointInvariant (segmentize { ep with sendQueue := ep.sendQueue ++ data }).1
+    exact segmentize_preserves _ h
+
+/-- After segmentize, adding 1 to sndNxt preserves sndUna ≤ sndNxt. -/
+private theorem segmentize_then_fin (ep : TcpEndpoint)
+    (h : endpointInvariant ep)
+    (hWnd : ep.tcb.sndNxt.val - ep.tcb.sndUna.val ≤ ep.tcb.sndWnd.toUInt32) :
+    SeqNum.le (segmentize ep).1.tcb.sndUna ((segmentize ep).1.tcb.sndNxt.add 1) = true := by
+  simp only [segmentize]
+  split
+  · -- inflight >= window
+    apply SeqNum.le_add_of_le _ _ _ h
+    exact window_plus_one_lt_halfSpace _ ep.tcb.sndWnd hWnd
+  · rename_i h_inflight
+    split
+    · -- available = 0
+      apply SeqNum.le_add_of_le _ _ _ h
+      exact window_plus_one_lt_halfSpace _ ep.tcb.sndWnd hWnd
+    · -- send data + FIN
+      dsimp only []
+      rw [SeqNum.add_add]
+      apply SeqNum.le_add_of_le _ _ _ h
+      apply inflight_sent_fin_lt_halfSpace _ _ ep.tcb.sndWnd (Nat.lt_of_not_le h_inflight)
+      apply UInt32_ofNat_le
+      simp [List.length_take]; omega
 
 theorem processClose_preserves (ep : TcpEndpoint)
     (h : endpointInvariant ep)
-    (hBound : SeqNum.le ep.tcb.sndUna
-      (ep.tcb.sndNxt.add (ep.sendQueue.length.toUInt32 + 1)) = true) :
+    (hWnd : ep.tcb.sndNxt.val - ep.tcb.sndUna.val ≤ ep.tcb.sndWnd.toUInt32) :
     endpointInvariant (processClose ep).endpoint := by
-  cases hState : ep.state <;>
-    simp only [processClose, hState, segmentize] <;>
-    first
-    | exact h
-    | exact closedEndpoint_invariant
-    | (split <;> simp_all [endpointInvariant])
-
--- ============================================================================
--- processSegmentSynSent
--- ============================================================================
-
-theorem processSegmentSynSent_preserves (ep : TcpEndpoint) (seg : Segment)
-    (h : endpointInvariant ep) :
-    endpointInvariant (processSegmentSynSent ep seg).endpoint := by
-  unfold processSegmentSynSent
-  dsimp only [mkSegment, defaultRcvWnd]
-  -- Exhaustive case splits on all boolean conditions
-  split <;> (try split) <;> (try split) <;> (try split) <;> (try split) <;> (try split) <;> (try split) <;>
-    first
-    | exact h
-    | exact closedEndpoint_invariant
-    | (simp only [endpointInvariant]; simp_all)
+  simp only [processClose]
+  split
+  · exact h  -- Closed
+  · exact closedEndpoint_invariant  -- Listen
+  · exact closedEndpoint_invariant  -- SynSent
+  · -- SynReceived
+    split
+    · simp only [endpointInvariant]
+      apply SeqNum.le_add_of_le _ _ _ h
+      exact window_plus_one_lt_halfSpace _ ep.tcb.sndWnd hWnd
+    · exact h
+  · -- Established: segmentize + FIN
+    simp only [endpointInvariant]
+    exact segmentize_then_fin ep h hWnd
+  · exact h  -- FinWait1
+  · exact h  -- FinWait2
+  · -- CloseWait: segmentize + FIN
+    simp only [endpointInvariant]
+    exact segmentize_then_fin ep h hWnd
+  · exact h  -- Closing
+  · exact h  -- LastAck
+  · exact h  -- TimeWait
 
 -- ============================================================================
 -- Pipeline preservation
@@ -224,6 +307,24 @@ theorem pipelinePostAck_preserves (ep : TcpEndpoint) (seg : Segment)
   simp only [pipelinePostAck]
   exact pipelineFin_preserves _ seg _
     (pipelineText_preserves _ seg (pipelineUrg_preserves ep seg h))
+
+-- ============================================================================
+-- processSegmentSynSent
+-- ============================================================================
+
+theorem processSegmentSynSent_preserves (ep : TcpEndpoint) (seg : Segment)
+    (h : endpointInvariant ep) :
+    endpointInvariant (processSegmentSynSent ep seg).endpoint := by
+  unfold processSegmentSynSent
+  dsimp only [mkSegment, defaultRcvWnd]
+  split <;> (try split) <;> (try split) <;> (try split) <;> (try split) <;> (try split) <;> (try split)
+  all_goals (try exact h)
+  all_goals (try exact closedEndpoint_invariant)
+  -- Remaining: pipelinePostAck goals for ESTABLISHED path
+  all_goals
+    dsimp only []
+    apply pipelinePostAck_preserves
+    simp_all [endpointInvariant]
 
 theorem pipelinePreAck_preserves (ep : TcpEndpoint) (seg : Segment)
     (h : endpointInvariant ep) (result : ProcessResult)
@@ -260,13 +361,10 @@ theorem pipelineAck_preserves (ep : TcpEndpoint) (seg : Segment)
     · simp at hAck; rw [← hAck]
       rename_i hCond; simp [Bool.and_eq_true] at hCond; exact hCond.2
     · simp at hAck
-  · -- Established
+  · -- Established: future ACK guard, then ackUpdate
     split at hAck
-    · simp at hAck; rw [← hAck]
-      exact ackUpdate_preserves _ _ h
-    · split at hAck
-      · simp at hAck
-      · simp at hAck; rw [← hAck]; exact h
+    · simp at hAck  -- future ACK → none
+    · simp at hAck; rw [← hAck]; exact ackUpdate_preserves _ _ h
   · -- FinWait1: future ACK guard, then ackUpdate + state change
     split at hAck
     · simp at hAck  -- future ACK → none, contradicts some ep'
@@ -361,9 +459,9 @@ theorem systemStep_preserves_invariant (s s' : System)
     systemInvariant s' := by
   obtain ⟨hA, hB⟩ := hInv
   cases hStep with
-  | deliverToA seg rest h_net result h_proc =>
+  | deliverToA seg h_mem result h_proc =>
     exact ⟨h_proc ▸ processSegment_preserves _ seg _ hA, hB⟩
-  | deliverToB seg rest h_net result h_proc =>
+  | deliverToB seg h_mem result h_proc =>
     exact ⟨hA, h_proc ▸ processSegment_preserves _ seg _ hB⟩
   | userCallA call result h_proc =>
     exact ⟨h_userA call result h_proc, hB⟩
@@ -373,7 +471,7 @@ theorem systemStep_preserves_invariant (s s' : System)
     exact ⟨h_proc ▸ processTimeout_preserves _ kind hA, hB⟩
   | timeoutB kind result h_proc =>
     exact ⟨hA, h_proc ▸ processTimeout_preserves _ kind hB⟩
-  | segmentLoss seg rest h_net =>
+  | segmentLoss seg h_mem =>
     exact ⟨hA, hB⟩
   | segmentDup seg h_mem =>
     exact ⟨hA, hB⟩
