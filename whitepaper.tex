@@ -14,7 +14,7 @@
   commentstyle=\color{gray},
   breaklines=true,
   frame=single,
-  language=lean
+  language={}
 }
 
 \theoremstyle{definition}
@@ -288,9 +288,11 @@ Proved as \texttt{simultaneousOpen\_enters\_synReceived}.
 An endpoint can only reach ESTABLISHED by processing a delivered segment while
 in SYN-SENT or SYN-RECEIVED state. No user call, timeout, or other state
 transition enters ESTABLISHED. Entering SYN-SENT requires an active OPEN;
-entering SYN-RECEIVED requires receiving a SYN; entering ESTABLISHED from
-SYN-SENT requires a SYN+ACK. These lemmas together prove that ESTABLISHED
-is reachable only through the three-way handshake.
+entering SYN-RECEIVED requires receiving a SYN (proved as
+\texttt{processSegmentListen\_syn}); and without SYN, the SYN-SENT endpoint
+cannot enter ESTABLISHED (proved as
+\texttt{processSegmentSynSent\_not\_established\_without\_syn}). Together these
+lemmas show that the three-way handshake is the only path to ESTABLISHED.
 Proved as \texttt{established\_requires\_handshake\_step},
 \texttt{established\_only\_from\_pre\_established},
 \texttt{processUserCall\_not\_established},
@@ -343,7 +345,8 @@ Proved as \texttt{no\_data\_in\_closed}, \texttt{no\_data\_in\_listen},
 $\texttt{SND.UNA} \leq \texttt{SND.NXT}$ is preserved by every processing
 function. Per-function preservation theorems are proved symbolically:
 \texttt{processOpen\_preserves}, \texttt{processSegment\_preserves},
-\texttt{processClose\_preserves}, \texttt{processSend\_preserves},
+\texttt{processClose\_preserves'} (using the window invariant to eliminate
+the external send-window hypothesis), \texttt{processSend\_preserves},
 \texttt{processTimeout\_preserves}, etc.
 \end{theorem}
 
@@ -387,7 +390,7 @@ Proved as \texttt{systemStep\_rcvNxt\_monotone}.
 \end{theorem}
 
 \begin{theorem}[Send Window Invariant under Cooperative Peer]
-Under the cooperative peer assumption (RFC~1122 \S4.2.2.16), in the
+Under the cooperative peer assumption (RFC~1122~\cite{rfc1122} \S4.2.2.16), in the
 data-transfer states (\textsc{Established} and \textsc{Close-Wait}),
 $\texttt{SND.NXT} \leq \texttt{SND.UNA} + \texttt{SND.WND}$. The cooperative
 predicate (\texttt{windowNonShrinking}) requires that the peer's advertised
@@ -405,7 +408,7 @@ Proved as \texttt{systemStep\_preserves\_sendWindow} with zero \texttt{sorry}.
 We have presented a machine-checked formalization of TCP (RFC~793) in Lean~4,
 covering modular sequence number arithmetic, the full event-processing state
 machine, segment acceptability, connection establishment, graceful teardown,
-and safety invariants including a cooperative send window bound (RFC~1122
+and safety invariants including a cooperative send window bound (RFC~1122~\cite{rfc1122}
 \S4.2.2.16). All proofs compile with zero \texttt{sorry}.
 
 \subsection{Design Decisions}
