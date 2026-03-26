@@ -122,7 +122,7 @@ This corresponds to $(b - a) \bmod 2^{32} \in (0, 2^{31})$.
 \end{definition}
 
 \begin{theorem}[Irreflexivity]
-\texttt{SeqNum.lt} is irreflexive: $\forall a,\; \lnot(a < a)$.
+\texttt{SeqNum.lt} is irreflexive: $\forall a,\; \texttt{lt}\; a\; a = \texttt{false}$.
 This follows because $a - a = 0$, and the predicate requires $d \neq 0$.
 Proved as \texttt{SeqNum.lt\_irrefl}.
 \end{theorem}
@@ -253,10 +253,13 @@ A data-bearing segment is never acceptable when $\texttt{RCV.WND} = 0$.
 Proved as \texttt{segmentAcceptable\_data\_zeroWnd}.
 \end{lemma}
 
-\begin{lemma}[ACK preserves invariant]
-If an ACK is acceptable (ESTABLISHED-style), advancing \texttt{SND.UNA} to
-\texttt{SEG.ACK} preserves $\texttt{SND.UNA} \leq \texttt{SND.NXT}$.
+\begin{lemma}[ACK acceptability bound]
+If an ACK is acceptable (ESTABLISHED-style), then
+$\texttt{SEG.ACK} \leq \texttt{SND.NXT}$.
 Proved as \texttt{ackAcceptable\_preserves\_invariant}.
+It follows that advancing $\texttt{SND.UNA}$ to $\texttt{SEG.ACK}$
+preserves $\texttt{SND.UNA} \leq \texttt{SND.NXT}$; this is proved
+directly as \texttt{ackAdvanceTcb\_preserves}.
 \end{lemma}
 
 \section{Connection Establishment}
