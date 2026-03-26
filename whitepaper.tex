@@ -38,7 +38,8 @@ the TCP state machine, define segment acceptability predicates over modular
 connection establishment (three-way handshake), graceful teardown, and global
 safety invariants including an unconditional system invariant, send window
 bounds, and sequence number monotonicity. We prove that reaching ESTABLISHED
-state requires a three-way handshake. The formalization uses a two-endpoint
+state requires segment delivery from SYN-SENT or SYN-RECEIVED---the states
+produced by the three-way handshake. The formalization uses a two-endpoint
 system model with an explicit network, capturing reordering, loss, and
 duplication. All theorems are verified by Lean's kernel with zero uses of
 \texttt{sorry}---if the code typechecks, the proofs hold.
@@ -86,8 +87,9 @@ contributions are:
     invariant with send window bounds, and \texttt{SND.UNA}/\texttt{RCV.NXT}
     monotonicity.
   \item \textbf{Handshake safety property}: ESTABLISHED is only reachable
-    from SYN-SENT or SYN-RECEIVED, both of which require exchanging SYN and
-    SYN-ACK segments.
+    via segment delivery from SYN-SENT or SYN-RECEIVED. No user call or
+    timeout enters ESTABLISHED. Separate lemmas show SYN-SENT requires an
+    active OPEN and SYN-RECEIVED requires receiving a SYN.
 \end{enumerate}
 
 All proofs compile with zero uses of \texttt{sorry}. The formalization targets
@@ -388,16 +390,13 @@ Proved as \texttt{systemStep\_rcvNxt\_monotone}.
 Under the cooperative peer assumption (RFC~1122 \S4.2.2.16), in the
 data-transfer states (\textsc{Established} and \textsc{Close-Wait}),
 $\texttt{SND.NXT} \leq \texttt{SND.UNA} + \texttt{SND.WND}$. The cooperative
-assumption (\texttt{windowNonShrinking}) requires that after ACK processing,
-the send window still covers all sent data. This is preserved by every
-\texttt{SystemStep}: user calls and timeouts unconditionally, segment delivery
-under the cooperative assumption.
+predicate (\texttt{windowNonShrinking}) requires that the peer's advertised
+right edge ($\texttt{SEG.ACK} + \texttt{SEG.WND}$) covers all sent data
+($\texttt{SND.NXT}$). This is preserved by every \texttt{SystemStep}: user
+calls and timeouts unconditionally, segment delivery under the cooperative
+assumption. The proof also requires the combined \texttt{endpointInvariant}
+to hold on the processing endpoint.
 Proved as \texttt{systemStep\_preserves\_sendWindow} with zero \texttt{sorry}.
-The cooperative predicate (\texttt{windowNonShrinking}) requires that the
-peer's advertised right edge ($\texttt{SEG.ACK} + \texttt{SEG.WND}$) covers
-all sent data ($\texttt{SND.NXT}$). Preservation is unconditional for user
-calls, timeouts, and network events; segment delivery requires the
-cooperative assumption.
 \end{theorem}
 
 \section{Conclusion}
