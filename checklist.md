@@ -73,12 +73,12 @@ Run `lake build` after each phase to confirm zero `sorry` and no errors.
     through the appropriate processing functions.
   - `lake build` must pass.
 
-- [ ] 3.2 Document reassembly as a known limitation
+- [x] 3.2 Document reassembly as a known limitation
   - Add a note in the whitepaper Known Deviations section explaining that the
     model assumes in-order segment delivery for data processing and does not
     implement reassembly.
 
-- [ ] 3.3 Update whitepaper
+- [x] 3.3 Update whitepaper
   - Reflect all Phase 1 bug fixes, Phase 2 invariants, and Phase 3 safety
     property in the whitepaper text. Ensure every theorem cited in the paper
     corresponds to a named Lean theorem.
@@ -86,6 +86,6 @@ Run `lake build` after each phase to confirm zero `sorry` and no errors.
 
 ## Final validation
 
-- [ ] `lake build` succeeds with zero `sorry`
-- [ ] `git diff` reviewed for correctness
-- [ ] All changes committed
+- [x] `lake build` succeeds with zero `sorry`
+- [x] `git diff` reviewed for correctness
+- [x] All changes committed

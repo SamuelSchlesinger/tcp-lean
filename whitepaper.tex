@@ -36,10 +36,12 @@ Protocol as specified in RFC~793. Using the Lean~4 theorem prover, we model
 the TCP state machine, define segment acceptability predicates over modular
 32-bit sequence number arithmetic, and prove correctness properties of
 connection establishment (three-way handshake), graceful teardown, and global
-safety invariants. The formalization uses a two-endpoint system model with an
-explicit network, capturing reordering, loss, and duplication. All theorems
-are verified by Lean's kernel with zero uses of \texttt{sorry}---if the code
-typechecks, the proofs hold.
+safety invariants including an unconditional system invariant, send window
+bounds, and sequence number monotonicity. We prove that reaching ESTABLISHED
+state requires a three-way handshake. The formalization uses a two-endpoint
+system model with an explicit network, capturing reordering, loss, and
+duplication. All theorems are verified by Lean's kernel with zero uses of
+\texttt{sorry}---if the code typechecks, the proofs hold.
 \end{abstract}
 
 \tableofcontents
@@ -80,7 +82,12 @@ contributions are:
     correctly.
   \item \textbf{Safety invariants}: no data before ESTABLISHED,
     \texttt{SND.UNA} $\leq$ \texttt{SND.NXT} preservation across handshake
-    and close, and ACK acceptability preservation.
+    and close, ACK acceptability preservation, an unconditional system
+    invariant with send window bounds, and \texttt{SND.UNA}/\texttt{RCV.NXT}
+    monotonicity.
+  \item \textbf{Handshake safety property}: ESTABLISHED is only reachable
+    from SYN-SENT or SYN-RECEIVED, both of which require exchanging SYN and
+    SYN-ACK segments.
 \end{enumerate}
 
 All proofs compile with zero uses of \texttt{sorry}. The formalization targets
@@ -275,6 +282,19 @@ for the first phase of simultaneous open.
 Proved as \texttt{simultaneousOpen\_enters\_synReceived}.
 \end{theorem}
 
+\begin{theorem}[ESTABLISHED Requires Handshake]
+An endpoint can only reach ESTABLISHED by processing a delivered segment while
+in SYN-SENT or SYN-RECEIVED state. No user call, timeout, or other state
+transition enters ESTABLISHED. Entering SYN-SENT requires an active OPEN;
+entering SYN-RECEIVED requires receiving a SYN; entering ESTABLISHED from
+SYN-SENT requires a SYN+ACK. These lemmas together prove that ESTABLISHED
+is reachable only through the three-way handshake.
+Proved as \texttt{established\_requires\_handshake\_step},
+\texttt{established\_only\_from\_pre\_established},
+\texttt{processUserCall\_not\_established},
+and \texttt{processTimeout\_not\_established}.
+\end{theorem}
+
 \begin{theorem}[RST Handling]
 A valid RST in SYN-RECEIVED with passive origin returns the endpoint to
 LISTEN. A valid RST in ESTABLISHED aborts the connection.
@@ -332,13 +352,36 @@ This is the key lemma for proving monotonicity inductively over system traces.
 Proved as \texttt{ackAdvanceTcb\_preserves}.
 \end{theorem}
 
-\begin{theorem}[SystemStep Invariant]
-The system invariant $\texttt{SND.UNA} \leq \texttt{SND.NXT}$ on both
-endpoints is preserved by every \texttt{SystemStep} transition. For segment
-delivery, timeout, and abort steps, preservation is unconditional. For user
-SEND/CLOSE calls, the proof requires that sequence number advancement stays
-in the forward half-space (guaranteed in real TCP by the send window per
-RFC~793 \S3.7). Proved as \texttt{systemStep\_preserves\_invariant}.
+\begin{theorem}[Window Invariant]
+In-flight bytes (\texttt{SND.NXT} $-$ \texttt{SND.UNA}) remain bounded within
+the forward half-space with room for future advances. Pre-FIN states maintain
+a bound of $+2 < 2^{31}$; post-FIN states (where no more data will be sent)
+maintain $+1 < 2^{31}$. This is proved preserved by every processing function.
+Proved as \texttt{windowInvariant} with per-function preservation theorems.
+\end{theorem}
+
+\begin{theorem}[SystemStep Invariant (Unconditional)]
+The combined system invariant---$\texttt{SND.UNA} \leq \texttt{SND.NXT}$,
+the window bound, and the ISS structural invariant for SYN-SENT---is preserved
+by every \texttt{SystemStep} transition \emph{unconditionally}, with no
+blanket hypotheses. The window invariant provides the half-space room needed
+for CLOSE's FIN, eliminating the need for external send-window assumptions.
+Proved as \texttt{systemStep\_preserves\_invariant}.
+\end{theorem}
+
+\begin{theorem}[SND.UNA Monotonicity]
+For any \texttt{SystemStep}, each endpoint's \texttt{SND.UNA} is monotonically
+non-decreasing (modulo connection teardown to CLOSED or fresh connection
+initialization from CLOSED/LISTEN).
+Proved as \texttt{systemStep\_sndUna\_monotone}.
+\end{theorem}
+
+\begin{theorem}[RCV.NXT Monotonicity]
+For any \texttt{SystemStep} with well-formed segments (data length
+$< 2^{31} - 1$), each endpoint's \texttt{RCV.NXT} is monotonically
+non-decreasing (modulo connection teardown or initialization from
+CLOSED/LISTEN/SYN-SENT).
+Proved as \texttt{systemStep\_rcvNxt\_monotone}.
 \end{theorem}
 
 \section{Conclusion}
@@ -363,10 +406,7 @@ IP-layer concerns.
 This formalization intentionally excludes several RFC~793 features:
 security/compartment/precedence (\S3.6), checksum computation, MSS option
 negotiation, ISN clock-based generation (\S3.3), RTO calculation (\S3.7),
-and IP-layer interactions. The \texttt{SystemStep} invariant proof for user
-SEND/CLOSE calls relies on a blanket hypothesis that sequence number
-advancement stays within the forward half-space, rather than deriving this
-from send window bounds.
+and IP-layer interactions.
 
 Known deviations from RFC~793:
 \begin{itemize}
@@ -383,14 +423,23 @@ Known deviations from RFC~793:
     retransmission timer, 2$\times$MSL timer, or user timeout timer as
     explicit state. Timeouts are modeled as nondeterministic events via
     \texttt{SystemStep}.
+  \item \textbf{No segment reassembly}: the model assumes in-order segment
+    delivery for data processing. Out-of-order segments are buffered in
+    \texttt{reassemblyBuf} but never reassembled; the \texttt{pipelineText}
+    function appends data directly to \texttt{recvBuffer} and advances
+    \texttt{RCV.NXT} by the segment's data length. A full reassembly
+    implementation would require tracking sequence number ranges and merging
+    overlapping segments, which is orthogonal to the protocol state machine
+    properties proved here.
 \end{itemize}
 
 \subsection{Future Work}
 
 Natural extensions include: congestion control (RFC~5681); window scaling and
 timestamps (RFC~7323); modeling of the full simultaneous open handshake
-completion through SYN-RECEIVED to ESTABLISHED; and deriving the
-SEND/CLOSE half-space hypothesis from send window bounds.
+completion through SYN-RECEIVED to ESTABLISHED; segment reassembly for
+out-of-order delivery; and data delivery correctness (proving that the
+received byte stream matches the sent byte stream in order).
 
 \bibliographystyle{plain}
 \bibliography{references}
