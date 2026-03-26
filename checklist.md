@@ -41,25 +41,25 @@ Run `lake build` after each phase to confirm zero `sorry` and no errors.
 
 ## Phase 2: Close the invariant hole
 
-- [ ] 2.1 Prove send window bound invariant
+- [x] 2.1 Prove send window bound invariant
   - Define `windowInvariant ep := SeqNum.le ep.tcb.sndNxt
     (ep.tcb.sndUna.add ep.tcb.sndWnd.toUInt32) = true`.
   - Prove it is preserved by every processing function.
   - `lake build` must pass.
 
-- [ ] 2.2 Remove blanket hypotheses from systemStep_preserves_invariant
+- [x] 2.2 Remove blanket hypotheses from systemStep_preserves_invariant
   - Strengthen `endpointInvariant` to include both `SND.UNA <= SND.NXT` and the
     window bound.
   - Remove `h_userA` and `h_userB` parameters from
     `systemStep_preserves_invariant`. The proof should be fully unconditional.
   - `lake build` must pass.
 
-- [ ] 2.3 Prove SND.UNA monotonicity
+- [x] 2.3 Prove SND.UNA monotonicity
   - Theorem: for any SystemStep, the new `SND.UNA` is `>=` the old `SND.UNA`
     (using SeqNum.le).
   - `lake build` must pass.
 
-- [ ] 2.4 Prove RCV.NXT monotonicity
+- [x] 2.4 Prove RCV.NXT monotonicity
   - Theorem: for any SystemStep, the new `RCV.NXT` is `>=` the old `RCV.NXT`
     (using SeqNum.le).
   - `lake build` must pass.
