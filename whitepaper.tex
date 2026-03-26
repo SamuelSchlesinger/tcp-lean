@@ -313,16 +313,18 @@ Proved as \texttt{rst\_synReceived\_passive\_returns\_to\_listen} and
 \label{sec:teardown}
 
 \begin{theorem}[CLOSE from ESTABLISHED]
-CLOSE from ESTABLISHED transitions to FIN-WAIT-1, emits a FIN segment, and
-advances $\texttt{SND.NXT}$ by 1 (FIN occupies one sequence number).
+CLOSE from ESTABLISHED (with empty send queue) transitions to FIN-WAIT-1
+and advances $\texttt{SND.NXT}$ by 1 (FIN occupies one sequence number).
 Proved as \texttt{close\_established\_enters\_finWait1} and
-\texttt{fin\_occupies\_sequence\_space}.
+\texttt{fin\_occupies\_sequence\_space}. With pending data in the send
+queue, \texttt{segmentize} flushes it before the FIN.
 \end{theorem}
 
 \begin{theorem}[CLOSE-WAIT $\to$ LAST-ACK]
-CLOSE from CLOSE-WAIT enters LAST-ACK (not CLOSING). The RFC~793 \S3.9 text
-says ``enter CLOSING state'' but Figure~6 (the state diagram) shows
-CLOSE-WAIT $\to$ LAST-ACK. We follow Figure~6 as authoritative.
+CLOSE from CLOSE-WAIT (with empty send queue) enters LAST-ACK (not CLOSING).
+The RFC~793 \S3.9 text says ``enter CLOSING state'' but Figure~6 (the state
+diagram) shows CLOSE-WAIT $\to$ LAST-ACK. We follow Figure~6 as
+authoritative.
 Proved as \texttt{close\_closeWait\_enters\_lastAck}.
 \end{theorem}
 
