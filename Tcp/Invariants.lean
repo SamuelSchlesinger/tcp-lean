@@ -2066,4 +2066,447 @@ theorem systemStep_rcvNxt_monotone (s s' : System)
   | segmentDup seg h_mem =>
     exact ⟨Or.inl (SeqNum.le_refl _), Or.inl (SeqNum.le_refl _)⟩
 
+-- ============================================================================
+-- Phase 3.1: ESTABLISHED Requires Handshake
+-- ============================================================================
+
+/-! ### Per-function lemmas: which transitions can produce ESTABLISHED
+
+We prove that ESTABLISHED is only reachable by processing a segment, never by
+a user call or timeout, and that the segment must carry specific control bits.
+Together these lemmas show that a three-way handshake (SYN → SYN-ACK → ACK)
+is the *only* path to ESTABLISHED. -/
+
+-- --------------------------------------------------------------------------
+-- User calls never enter ESTABLISHED from a non-ESTABLISHED state
+-- --------------------------------------------------------------------------
+
+/-- `processOpen` never transitions to ESTABLISHED. -/
+theorem processOpen_not_established (ep : TcpEndpoint) (mode : OpenMode) (iss : SeqNum)
+    (hPre : ep.state ≠ .Established) :
+    (processOpen ep mode iss).endpoint.state ≠ .Established := by
+  simp only [processOpen]
+  split
+  · split <;> simp_all [TcpState.noConfusion]
+  · split <;> simp_all [TcpState.noConfusion]
+  · exact hPre
+
+/-- `processSend` preserves the connection state. -/
+theorem processSend_state (ep : TcpEndpoint) (data : List UInt8) :
+    (processSend ep data).endpoint.state = ep.state ∨
+    (processSend ep data).endpoint.state = .Closed := by
+  simp only [processSend]
+  split <;> simp_all
+  all_goals (try (left; rfl))
+  -- Established / CloseWait: segmentize preserves state
+  all_goals
+    left; show (segmentize _).1.state = _
+    simp only [segmentize]; split <;> (try split) <;> simp_all
+
+/-- `processSend` never transitions to ESTABLISHED from non-ESTABLISHED. -/
+theorem processSend_not_established (ep : TcpEndpoint) (data : List UInt8)
+    (hPre : ep.state ≠ .Established) :
+    (processSend ep data).endpoint.state ≠ .Established := by
+  have h := processSend_state ep data
+  cases h with
+  | inl h => rw [h]; exact hPre
+  | inr h => rw [h]; exact TcpState.noConfusion
+
+/-- `processReceive` preserves state. -/
+theorem processReceive_state (ep : TcpEndpoint) :
+    (processReceive ep).endpoint.state = ep.state := by
+  simp only [processReceive]; split <;> (try split) <;> simp_all
+
+/-- `processReceive` never transitions to ESTABLISHED from non-ESTABLISHED. -/
+theorem processReceive_not_established (ep : TcpEndpoint)
+    (hPre : ep.state ≠ .Established) :
+    (processReceive ep).endpoint.state ≠ .Established := by
+  rw [processReceive_state]; exact hPre
+
+/-- `processClose` never transitions to ESTABLISHED. -/
+theorem processClose_not_established (ep : TcpEndpoint)
+    (hPre : ep.state ≠ .Established) :
+    (processClose ep).endpoint.state ≠ .Established := by
+  simp only [processClose]
+  cases hState : ep.state <;> simp_all [closedEndpoint, TcpState.noConfusion]
+  -- SynReceived: split on sendQueue.isEmpty
+  split
+  · simp [TcpState.noConfusion]
+  · rw [hState]; exact TcpState.noConfusion
+
+/-- `processAbort` never transitions to ESTABLISHED. -/
+theorem processAbort_not_established (ep : TcpEndpoint)
+    (hPre : ep.state ≠ .Established) :
+    (processAbort ep).endpoint.state ≠ .Established := by
+  simp only [processAbort]
+  split <;> simp_all [closedEndpoint, TcpState.noConfusion]
+
+/-- No user call can transition to ESTABLISHED from a non-ESTABLISHED state. -/
+theorem processUserCall_not_established (ep : TcpEndpoint) (call : UserCall)
+    (hPre : ep.state ≠ .Established) :
+    (processUserCall ep call).endpoint.state ≠ .Established := by
+  simp only [processUserCall]
+  cases call with
+  | Open mode iss => exact processOpen_not_established ep mode iss hPre
+  | Send data => exact processSend_not_established ep data hPre
+  | Receive => exact processReceive_not_established ep hPre
+  | Close => exact processClose_not_established ep hPre
+  | Abort => exact processAbort_not_established ep hPre
+  | Status => simp; exact hPre
+
+-- --------------------------------------------------------------------------
+-- Timeouts never enter ESTABLISHED
+-- --------------------------------------------------------------------------
+
+/-- No timeout can transition to ESTABLISHED. -/
+theorem processTimeout_not_established (ep : TcpEndpoint)
+    (kind : TimeoutKind)
+    (hPre : ep.state ≠ .Established) :
+    (processTimeout ep kind).endpoint.state ≠ .Established := by
+  simp only [processTimeout]
+  split
+  · simp [closedEndpoint, TcpState.noConfusion]
+  · split <;> exact hPre
+  · split
+    · simp [closedEndpoint, TcpState.noConfusion]
+    · exact hPre
+
+-- --------------------------------------------------------------------------
+-- Segment processing in CLOSED state never enters ESTABLISHED
+-- --------------------------------------------------------------------------
+
+/-- Segment arrival in CLOSED state never transitions to ESTABLISHED. -/
+theorem processSegmentClosed_not_established (ep : TcpEndpoint) (seg : Segment)
+    (hPre : ep.state ≠ .Established) :
+    (processSegmentClosed ep seg).endpoint.state ≠ .Established := by
+  simp only [processSegmentClosed]
+  split <;> (try split) <;> exact hPre
+
+-- --------------------------------------------------------------------------
+-- LISTEN → SYN-RECEIVED requires SYN
+-- --------------------------------------------------------------------------
+
+/-- If `processSegmentListen` changes the state from LISTEN, the new state
+    is SYN-RECEIVED and the segment had SYN set. -/
+theorem processSegmentListen_syn (ep : TcpEndpoint) (seg : Segment) (iss : SeqNum)
+    (hState : ep.state = .Listen)
+    (hChanged : (processSegmentListen ep seg iss).endpoint.state ≠ .Listen) :
+    (processSegmentListen ep seg iss).endpoint.state = .SynReceived ∧
+    seg.ctl.syn = true := by
+  unfold processSegmentListen at hChanged ⊢
+  -- Simplify each if-then-else by splitting on the control bits
+  by_cases hRst : seg.ctl.rst = true
+  · simp [hRst, hState] at hChanged
+  · by_cases hAck : seg.ctl.ack = true
+    · simp [hRst, hAck, hState] at hChanged
+    · by_cases hSyn : seg.ctl.syn = true
+      · simp [hRst, hAck, hSyn]
+      · simp [hRst, hAck, hSyn, hState] at hChanged
+
+/-- `processSegmentListen` never enters ESTABLISHED. -/
+theorem processSegmentListen_not_established (ep : TcpEndpoint) (seg : Segment)
+    (iss : SeqNum) (hState : ep.state = .Listen) :
+    (processSegmentListen ep seg iss).endpoint.state ≠ .Established := by
+  simp only [processSegmentListen]
+  split
+  · -- RST: state = ep.state = LISTEN
+    rw [hState]; exact TcpState.noConfusion
+  · split
+    · -- ACK: state = ep.state = LISTEN
+      rw [hState]; exact TcpState.noConfusion
+    · split
+      · -- SYN: state = SynReceived
+        exact TcpState.noConfusion
+      · -- else: state = ep.state = LISTEN
+        rw [hState]; exact TcpState.noConfusion
+
+-- --------------------------------------------------------------------------
+-- SYN-SENT → ESTABLISHED requires SYN ∧ ACK
+-- --------------------------------------------------------------------------
+
+-- --------------------------------------------------------------------------
+-- The 8-check pipeline: ESTABLISHED only from SYN-RECEIVED
+-- --------------------------------------------------------------------------
+
+/-- `pipelinePreAck` never produces ESTABLISHED from a non-ESTABLISHED state.
+    It either terminates with LISTEN, CLOSED, or the original state, or returns
+    `none` to continue. -/
+theorem pipelinePreAck_not_established (ep : TcpEndpoint) (seg : Segment)
+    (hPre : ep.state ≠ .Established) (result : ProcessResult)
+    (hSome : pipelinePreAck ep seg = some result) :
+    result.endpoint.state ≠ .Established := by
+  intro hEst
+  have h := hSome
+  unfold pipelinePreAck at h
+  revert h
+  split
+  · -- not acceptable
+    split
+    · intro h; cases h; exact hPre hEst
+    · dsimp only [mkSegment]; intro h; cases h; exact hPre hEst
+  · split  -- rst=true: state match
+    · split  -- SynReceived / openMode
+      · split  -- Passive
+        · intro h; simp only [Option.some.injEq] at h; rw [← h] at hEst
+          exact TcpState.noConfusion hEst
+        · intro h; simp only [Option.some.injEq] at h; rw [← h] at hEst
+          simp [closedEndpoint] at hEst
+      -- Established
+      · intro h; simp only [Option.some.injEq] at h; rw [← h] at hEst
+        simp [closedEndpoint] at hEst
+      -- FW1
+      · intro h; simp only [Option.some.injEq] at h; rw [← h] at hEst
+        simp [closedEndpoint] at hEst
+      -- FW2
+      · intro h; simp only [Option.some.injEq] at h; rw [← h] at hEst
+        simp [closedEndpoint] at hEst
+      -- CloseWait
+      · intro h; simp only [Option.some.injEq] at h; rw [← h] at hEst
+        simp [closedEndpoint] at hEst
+      -- Closing
+      · intro h; simp only [Option.some.injEq] at h; rw [← h] at hEst
+        simp [closedEndpoint] at hEst
+      -- LastAck
+      · intro h; simp only [Option.some.injEq] at h; rw [← h] at hEst
+        simp [closedEndpoint] at hEst
+      -- TimeWait
+      · intro h; simp only [Option.some.injEq] at h; rw [← h] at hEst
+        simp [closedEndpoint] at hEst
+      -- wildcard
+      · intro h; simp only [Option.some.injEq] at h; rw [← h] at hEst
+        exact hPre hEst
+    · split
+      · -- syn=true
+        dsimp only [mkSegment]; intro h; cases h; simp [closedEndpoint] at hEst
+      · -- syn=false: if (!seg.ctl.ack)
+        split
+        · intro h; cases h; exact hPre hEst
+        · intro h; exact absurd h (by simp)
+
+/-- `pipelineAck` enters ESTABLISHED only from SYN-RECEIVED. -/
+theorem pipelineAck_established_only_from_synReceived
+    (ep : TcpEndpoint) (seg : Segment) (ep' : TcpEndpoint)
+    (hPre : ep.state ≠ .Established)
+    (hAck : pipelineAck ep seg = some ep')
+    (hEst : ep'.state = .Established) :
+    ep.state = .SynReceived := by
+  simp only [pipelineAck] at hAck
+  split at hAck
+  · -- SynReceived
+    rename_i heq; exact heq
+  · -- Established: contradicts hPre
+    rename_i heq; exact absurd heq hPre
+  · -- FinWait1: future ACK guard, then state is FW1 or FW2
+    split at hAck
+    · simp at hAck
+    · simp only [Option.some.injEq] at hAck; rw [← hAck] at hEst
+      dsimp at hEst; split at hEst <;> (split at hEst <;> exact TcpState.noConfusion hEst)
+  · -- FinWait2
+    split at hAck
+    · simp at hAck
+    · simp only [Option.some.injEq] at hAck; rw [← hAck] at hEst
+      exact absurd hEst hPre
+  · -- CloseWait
+    split at hAck
+    · simp at hAck
+    · simp only [Option.some.injEq] at hAck; rw [← hAck] at hEst
+      exact absurd hEst hPre
+  · -- Closing
+    split at hAck
+    · simp at hAck
+    · split at hAck  -- match ep.finSeqNum
+      · split at hAck  -- if finAcked
+        · simp only [Option.some.injEq] at hAck; rw [← hAck] at hEst
+          exact TcpState.noConfusion hEst
+        · simp only [Option.some.injEq] at hAck; rw [← hAck] at hEst
+          exact absurd hEst hPre
+      · -- finSeqNum = none, finAcked = false
+        simp at hAck; rw [← hAck] at hEst
+        exact absurd hEst hPre
+  · -- LastAck
+    split at hAck  -- match ep.finSeqNum
+    · split at hAck  -- if finAcked
+      · simp only [Option.some.injEq] at hAck; rw [← hAck] at hEst
+        simp [closedEndpoint] at hEst
+      · simp only [Option.some.injEq] at hAck; rw [← hAck] at hEst
+        exact absurd hEst hPre
+    · -- finSeqNum = none
+      simp at hAck; rw [← hAck] at hEst
+      exact absurd hEst hPre
+  · -- TimeWait
+    simp only [Option.some.injEq] at hAck; rw [← hAck] at hEst
+    exact absurd hEst hPre
+  · -- wildcard
+    simp only [Option.some.injEq] at hAck; rw [← hAck] at hEst
+    exact absurd hEst hPre
+
+/-- `pipelinePostAck` starting from ESTABLISHED can only produce ESTABLISHED
+    or CloseWait (if the segment has FIN set). -/
+theorem pipelinePostAck_from_established (ep : TcpEndpoint) (seg : Segment)
+    (hState : ep.state = .Established) :
+    (pipelinePostAck ep seg).endpoint.state = .Established ∨
+    (pipelinePostAck ep seg).endpoint.state = .CloseWait := by
+  simp only [pipelinePostAck, pipelineFin]
+  split
+  · -- FIN set: match on state of (pipelineText (pipelineUrg ep seg) seg).1
+    simp only [pipelineUrg_state, pipelineText_state, hState]
+    right; trivial
+  · -- FIN not set: needAck branch
+    split
+    · left; simp [pipelineUrg_state, pipelineText_state, hState]
+    · left; simp [pipelineUrg_state, pipelineText_state, hState]
+
+/-- `pipelinePostAck` from a non-ESTABLISHED state never produces ESTABLISHED.
+    pipelineFin's only Established-related transition is SynReceived|Established → CloseWait.
+    pipelineUrg and pipelineText preserve state. -/
+theorem pipelinePostAck_not_established (ep : TcpEndpoint) (seg : Segment)
+    (hState : ep.state ≠ .Established) :
+    (pipelinePostAck ep seg).endpoint.state ≠ .Established := by
+  simp only [pipelinePostAck, pipelineFin]
+  split
+  · -- FIN set: match on state after pipelineUrg/pipelineText
+    simp only [pipelineUrg_state, pipelineText_state]
+    split
+    · exact TcpState.noConfusion  -- SynReceived → CloseWait
+    · exact TcpState.noConfusion  -- Established → CloseWait
+    · -- FW1 → TimeWait or Closing depending on finAcked
+      intro h; split at h <;> (split at h <;> exact TcpState.noConfusion h)
+    · exact TcpState.noConfusion  -- FW2 → TimeWait
+    · -- others: state unchanged (rcvNxt bumped but state = ep.state)
+      intro h; simp [pipelineUrg_state, pipelineText_state] at h; exact hState h
+  · -- FIN not set
+    split
+    · intro h; simp [pipelineUrg_state, pipelineText_state] at h; exact hState h
+    · intro h; simp [pipelineUrg_state, pipelineText_state] at h; exact hState h
+
+-- --------------------------------------------------------------------------
+-- The precondition states for reaching ESTABLISHED
+-- --------------------------------------------------------------------------
+
+/-- The precondition states of an endpoint that can transition to ESTABLISHED
+    in one segment-processing step. -/
+inductive PreEstablishedState : TcpState → Prop where
+  | synSent : PreEstablishedState .SynSent
+  | synReceived : PreEstablishedState .SynReceived
+
+/-- `processSegmentSynSent` only leaves state SynSent if SYN is set.
+    Without SYN, the only possible transitions are to SynSent or Closed. -/
+theorem processSegmentSynSent_not_established_without_syn
+    (ep : TcpEndpoint) (seg : Segment)
+    (hSyn : seg.ctl.syn = false) :
+    (processSegmentSynSent ep seg).endpoint.state = ep.state ∨
+    (processSegmentSynSent ep seg).endpoint.state = .Closed := by
+  unfold processSegmentSynSent
+  simp only [hSyn, ite_false]
+  -- After simp, the SYN branch is eliminated. Now case split on remaining conditions.
+  split  -- if seg.ctl.ack
+  all_goals (simp only [Bool.not_eq_true', ite_true, ite_false]; try (left; rfl))
+  all_goals split  -- if !ackOk
+  all_goals (try split)  -- if seg.ctl.rst etc
+  all_goals (first | (left; rfl) | (right; simp [closedEndpoint]) | (left; simp))
+
+/-- An endpoint can only enter ESTABLISHED from SYN-SENT or SYN-RECEIVED
+    via segment processing. No user call, timeout, or other state leads
+    to ESTABLISHED. -/
+theorem established_only_from_pre_established (ep : TcpEndpoint) (seg : Segment)
+    (iss : SeqNum)
+    (hPre : ep.state ≠ .Established)
+    (hEst : (processSegment ep seg iss).endpoint.state = .Established) :
+    PreEstablishedState ep.state := by
+  simp only [processSegment] at hEst
+  cases hState : ep.state <;> simp only [hState] at hEst
+  · -- Closed: processSegmentClosed always returns ep unchanged
+    simp only [processSegmentClosed] at hEst
+    split at hEst <;> (try (split at hEst)) <;>
+      (dsimp only [mkSegment] at hEst; exact absurd hEst (hState ▸ hPre))
+  · -- Listen
+    exact absurd hEst (processSegmentListen_not_established ep seg iss hState)
+  · -- SynSent
+    exact PreEstablishedState.synSent
+  · -- SynReceived
+    exact PreEstablishedState.synReceived
+  · -- Established: contradicts hPre
+    exact absurd hState hPre
+  -- All remaining states (FW1, FW2, CW, Closing, LA, TW) go through processSegmentOtherwise.
+  all_goals (
+    have hPreOrig : ep.state ≠ .Established := hPre
+    simp only [processSegmentOtherwise] at hEst
+    cases hPreAck : pipelinePreAck ep seg with
+    | some result =>
+      simp only [hPreAck] at hEst
+      exact absurd hEst (pipelinePreAck_not_established ep seg hPreOrig result hPreAck)
+    | none =>
+      simp only [hPreAck] at hEst
+      cases hAck2 : pipelineAck ep seg with
+      | none =>
+        simp only [hAck2, pipelineAckReject] at hEst
+        split at hEst <;> (dsimp only [mkSegment] at hEst; exact absurd hEst (hState ▸ hPreOrig))
+      | some ep' =>
+        simp only [hAck2] at hEst
+        have hEp'NotEst : ep'.state ≠ .Established := by
+          intro hContra
+          have := pipelineAck_established_only_from_synReceived ep seg ep' hPreOrig hAck2 hContra
+          rw [hState] at this; exact TcpState.noConfusion this
+        exact absurd hEst (pipelinePostAck_not_established ep' seg hEp'NotEst)
+  )
+
+/-- Combined handshake theorem: any SystemStep that changes endpoint A
+    to ESTABLISHED must deliver a segment and the endpoint must have been in
+    SYN-SENT or SYN-RECEIVED beforehand. Since entering SYN-SENT requires
+    an active OPEN, entering SYN-RECEIVED requires receiving a SYN, and
+    entering ESTABLISHED from SYN-SENT requires a SYN+ACK, the three-way
+    handshake is the only path. -/
+theorem established_requires_handshake_step (s s' : System)
+    (hStep : SystemStep s s')
+    (hPreA : s.endpointA.state ≠ .Established)
+    (hEstA : s'.endpointA.state = .Established) :
+    ∃ seg, seg ∈ s.network ∧
+    PreEstablishedState s.endpointA.state := by
+  cases hStep with
+  | deliverToA seg h_mem result h_proc =>
+    simp at hEstA
+    rw [← h_proc] at hEstA
+    exact ⟨seg, h_mem, established_only_from_pre_established _ seg _ hPreA hEstA⟩
+  | deliverToB seg h_mem result h_proc =>
+    simp at hEstA; exact absurd hEstA hPreA
+  | userCallA call result h_proc =>
+    simp at hEstA
+    rw [← h_proc] at hEstA
+    cases call with
+    | Open mode iss =>
+      simp only [processUserCall, processOpen] at hEstA
+      split at hEstA <;> (try split at hEstA) <;> simp_all [closedEndpoint, mkSegment]
+    | Send data =>
+      simp only [processUserCall, processSend] at hEstA
+      split at hEstA <;> (try simp_all [segmentize])
+      -- Established/CloseWait: segmentize preserves state; state is CloseWait in both branches
+      all_goals (split at hEstA <;> (dsimp only [mkSegment] at hEstA; exact TcpState.noConfusion hEstA))
+    | Receive =>
+      simp only [processUserCall, processReceive] at hEstA
+      split at hEstA <;> (try split at hEstA) <;> simp_all
+    | Close =>
+      simp only [processUserCall, processClose] at hEstA
+      split at hEstA <;> (try split at hEstA) <;> simp_all [closedEndpoint, segmentize, mkSegment]
+    | Abort =>
+      simp only [processUserCall, processAbort] at hEstA
+      split at hEstA <;> simp_all [closedEndpoint, mkSegment]
+    | Status =>
+      simp only [processUserCall] at hEstA
+      exact absurd hEstA hPreA
+  | userCallB call result h_proc =>
+    simp at hEstA; exact absurd hEstA hPreA
+  | timeoutA kind result h_proc =>
+    simp at hEstA; rw [← h_proc] at hEstA
+    simp only [processTimeout] at hEstA
+    split at hEstA
+    · simp [closedEndpoint] at hEstA
+    · split at hEstA <;> simp_all
+    · split at hEstA <;> simp_all [closedEndpoint]
+  | timeoutB kind result h_proc =>
+    simp at hEstA; exact absurd hEstA hPreA
+  | segmentLoss seg h_mem =>
+    simp at hEstA; exact absurd hEstA hPreA
+  | segmentDup seg h_mem =>
+    simp at hEstA; exact absurd hEstA hPreA
+
 end Tcp

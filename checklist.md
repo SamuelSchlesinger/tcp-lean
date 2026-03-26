@@ -66,7 +66,7 @@ Run `lake build` after each phase to confirm zero `sorry` and no errors.
 
 ## Phase 3: Prove meaningful properties
 
-- [ ] 3.1 Prove ESTABLISHED requires handshake
+- [x] 3.1 Prove ESTABLISHED requires handshake
   - Theorem: if endpoint A is ESTABLISHED in a system reachable from the initial
     state (both CLOSED, empty network), then a SYN and SYN-ACK were exchanged.
   - Define a handshake witness structure and show ESTABLISHED is only reachable
