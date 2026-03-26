@@ -2514,13 +2514,12 @@ theorem established_requires_handshake_step (s s' : System)
 -- Send Window Invariant under Cooperative Peer (RFC 1122 §4.2.2.16)
 -- ============================================================================
 
-/-- A segment is "cooperative" (RFC 1122 §4.2.2.16): after applying the
-    ACK update logic, `SND.NXT` still falls within the send window.
-    This accounts for the interplay between `ackAdvanceTcb` (which may
-    advance `SND.UNA`) and `windowUpdateTcb` (which may change `SND.WND`). -/
+/-- A segment is "cooperative" (RFC 1122 §4.2.2.16): the peer's advertised
+    right edge `SEG.ACK + SEG.WND` covers all data we have sent (`SND.NXT`).
+    This is a pure property of the segment relative to the endpoint — it does
+    not depend on `ackUpdate`'s internal branching. -/
 def windowNonShrinking (ep : TcpEndpoint) (seg : Segment) : Prop :=
-  SeqNum.le ep.tcb.sndNxt
-    ((ackUpdate ep seg).tcb.sndUna.add (ackUpdate ep seg).tcb.sndWnd.toUInt32) = true
+  SeqNum.le ep.tcb.sndNxt (seg.ackNum.add seg.window.toUInt32) = true
 
 /-- In the data-transfer states (`Established`, `CloseWait`), `SND.NXT`
     does not exceed the right edge of the send window. -/
@@ -2567,13 +2566,82 @@ theorem closedEndpoint_sendWindowInvariant : sendWindowInvariant closedEndpoint 
 -- Per-function preservation theorems
 -- ============================================================================
 
+@[simp] theorem ackAdvanceTcb_sndWl1 (tcb : Tcb) (seg : Segment) :
+    (ackAdvanceTcb tcb seg).sndWl1 = tcb.sndWl1 := by
+  simp only [ackAdvanceTcb]; split <;> simp_all
+
+@[simp] theorem ackAdvanceTcb_sndWl2 (tcb : Tcb) (seg : Segment) :
+    (ackAdvanceTcb tcb seg).sndWl2 = tcb.sndWl2 := by
+  simp only [ackAdvanceTcb]; split <;> simp_all
+
+@[simp] theorem ackAdvanceTcb_sndWnd (tcb : Tcb) (seg : Segment) :
+    (ackAdvanceTcb tcb seg).sndWnd = tcb.sndWnd := by
+  simp only [ackAdvanceTcb]; split <;> simp_all
+
+/-- Core circular arithmetic lemma for ackUpdate with 4-way case analysis
+    baked in. The `BEq SeqNum` (`sndWl1 == seq`) is fully reduced here. -/
+private theorem ackUpdate_sendWindow_core
+    (sndUna sndNxt sndWl1 sndWl2 ackNum seq : UInt32)
+    (sndWnd window : UInt16)
+    (hSW : SeqNum.le ⟨sndNxt⟩ (SeqNum.add ⟨sndUna⟩ sndWnd.toUInt32) = true)
+    (hCoop : SeqNum.le ⟨sndNxt⟩ (SeqNum.add ⟨ackNum⟩ window.toUInt32) = true)
+    (hNotFuture : ¬SeqNum.lt ⟨sndNxt⟩ ⟨ackNum⟩ = true)
+    (hBound : sndNxt - sndUna + 2 < SeqNum.halfSpace)
+    -- ackAdvanceTcb fires
+    (hAdv : (SeqNum.lt ⟨sndUna⟩ ⟨ackNum⟩ && SeqNum.le ⟨ackNum⟩ ⟨sndNxt⟩) = true)
+    -- windowUpdateTcb does NOT fire
+    (hNoWin : ¬(SeqNum.lt ⟨sndWl1⟩ ⟨seq⟩ || (sndWl1 == seq && SeqNum.le ⟨sndWl2⟩ ⟨ackNum⟩)) = true) :
+    SeqNum.le ⟨sndNxt⟩ (SeqNum.add ⟨ackNum⟩ sndWnd.toUInt32) = true := by
+  simp only [SeqNum.le, SeqNum.lt, SeqNum.add, SeqNum.halfSpace,
+    Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq, bne_iff_ne, ne_eq,
+    decide_eq_true_eq, Bool.not_eq_true'] at *
+  bv_decide
+
+private theorem ackUpdate_sendWindow_core2
+    (sndUna sndNxt ackNum : UInt32)
+    (sndWnd window : UInt16)
+    (hSW : SeqNum.le ⟨sndNxt⟩ (SeqNum.add ⟨sndUna⟩ sndWnd.toUInt32) = true)
+    (hCoop : SeqNum.le ⟨sndNxt⟩ (SeqNum.add ⟨ackNum⟩ window.toUInt32) = true)
+    (hNotFuture : ¬SeqNum.lt ⟨sndNxt⟩ ⟨ackNum⟩ = true)
+    (hBound : sndNxt - sndUna + 2 < SeqNum.halfSpace)
+    -- ackAdvanceTcb does NOT fire
+    (hNoAdv : ¬(SeqNum.lt ⟨sndUna⟩ ⟨ackNum⟩ && SeqNum.le ⟨ackNum⟩ ⟨sndNxt⟩) = true) :
+    -- windowUpdateTcb fires → need le sndNxt (sndUna + window)
+    SeqNum.le ⟨sndNxt⟩ (SeqNum.add ⟨sndUna⟩ window.toUInt32) = true := by
+  simp only [SeqNum.le, SeqNum.lt, SeqNum.add, SeqNum.halfSpace,
+    Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq, bne_iff_ne, ne_eq,
+    decide_eq_true_eq, Bool.not_eq_true'] at *
+  bv_decide
+
 theorem ackUpdate_preserves_sendWindow (ep : TcpEndpoint) (seg : Segment)
-    (hCoop : windowNonShrinking ep seg) :
+    (hSW : SeqNum.le ep.tcb.sndNxt (ep.tcb.sndUna.add ep.tcb.sndWnd.toUInt32) = true)
+    (hCoop : windowNonShrinking ep seg)
+    (hNotFuture : ¬SeqNum.lt ep.tcb.sndNxt seg.ackNum = true)
+    (hBound : ep.tcb.sndNxt.val - ep.tcb.sndUna.val + 2 < SeqNum.halfSpace) :
     SeqNum.le (ackUpdate ep seg).tcb.sndNxt
               ((ackUpdate ep seg).tcb.sndUna.add (ackUpdate ep seg).tcb.sndWnd.toUInt32) = true := by
-  simp only [windowNonShrinking, ackUpdate, windowUpdateTcb_sndNxt, ackAdvanceTcb_sndNxt] at hCoop
-  simp only [ackUpdate, windowUpdateTcb_sndNxt, ackAdvanceTcb_sndNxt]
-  exact hCoop
+  simp only [windowNonShrinking] at hCoop
+  simp only [ackUpdate]
+  simp only [windowUpdateTcb, ackAdvanceTcb_sndWl1, ackAdvanceTcb_sndWl2,
+    ackAdvanceTcb_sndNxt, ackAdvanceTcb_sndWnd]
+  split -- windowUpdateTcb condition
+  · -- windowUpdateTcb fires
+    simp only [ackAdvanceTcb]
+    split -- ackAdvanceTcb condition
+    · -- Both fire: right edge = seg.ackNum + seg.window
+      simp; exact hCoop
+    · -- ack doesn't, win fires: right edge = sndUna + seg.window
+      rename_i _ hNoAdv
+      exact ackUpdate_sendWindow_core2 _ _ _ ep.tcb.sndWnd seg.window hSW hCoop hNotFuture hBound hNoAdv
+  · -- windowUpdateTcb doesn't fire
+    simp only [ackAdvanceTcb]
+    split -- ackAdvanceTcb condition
+    · -- ack fires, win doesn't: right edge = seg.ackNum + sndWnd
+      rename_i hAdv; rename_i hNoWin
+      simp only []
+      exact ackUpdate_sendWindow_core _ _ _ _ _ _ ep.tcb.sndWnd seg.window hSW hCoop hNotFuture hBound hAdv hNoWin
+    · -- Neither fires: right edge unchanged
+      exact hSW
 
 private theorem segmentize_sendWindow_bound (una nxt : SeqNum) (w : UInt16) (n : UInt32)
     (hSW : SeqNum.le nxt (una.add w.toUInt32) = true)
@@ -2703,28 +2771,140 @@ private theorem pipelinePostAck_preserves_sendWindowInvariant (ep : TcpEndpoint)
   split <;> (try trivial)
   all_goals exact h
 
+/-- pipelineAck never outputs an endpoint in SynReceived state. -/
+private theorem pipelineAck_not_synReceived (ep : TcpEndpoint) (seg : Segment)
+    (ep' : TcpEndpoint) (hAck : pipelineAck ep seg = some ep') :
+    ep'.state ≠ .SynReceived := by
+  intro hContra
+  -- Use pipelineAck structure: case split on ep.state
+  simp only [pipelineAck] at hAck
+  cases hS : ep.state <;> simp only [hS] at hAck
+  -- Catch-all: some ep = some ep' → ep' = ep → ep'.state = ep.state ≠ SynReceived
+  all_goals (first | (simp at hAck; subst hAck; simp [hS] at hContra) | skip)
+  -- SynReceived: if-then-else → Established or none
+  · split at hAck <;> (first | (simp at hAck; subst hAck; simp at hContra) | exact absurd hAck (by simp))
+  -- Established, FinWait2, CloseWait: if-then-else → ackUpdate or none
+  · split at hAck <;> (first | (simp at hAck; subst hAck; simp [ackUpdate_state, hS] at hContra) | exact absurd hAck (by simp))
+  · split at hAck
+    · exact absurd hAck (by simp)
+    · simp at hAck; subst hAck; split at hContra <;> (try simp at hContra)
+      all_goals (split at hContra <;> simp at hContra)
+  · split at hAck <;> (first | (simp at hAck; subst hAck; simp [ackUpdate_state, hS] at hContra) | exact absurd hAck (by simp))
+  · split at hAck <;> (first | (simp at hAck; subst hAck; simp [ackUpdate_state, hS] at hContra) | exact absurd hAck (by simp))
+  -- Closing
+  · split at hAck
+    · exact absurd hAck (by simp)
+    · split at hAck <;> (try split at hAck)
+      all_goals (simp at hAck; subst hAck; simp [ackUpdate_state, closedEndpoint, hS] at hContra)
+  -- LastAck
+  · split at hAck <;> (try split at hAck)
+    all_goals (first | (simp at hAck; subst hAck; simp [closedEndpoint, hS] at hContra) | (simp [Bool.false_eq_true] at hAck; subst hAck; simp [hS] at hContra))
+
+
+/-- pipelineAck preserves the send window invariant.
+    When pipelineAck returns `some ep'`, the resulting endpoint satisfies
+    sendWindowInvariant. -/
+private theorem pipelineAck_preserves_sendWindow (ep : TcpEndpoint) (seg : Segment)
+    (ep' : TcpEndpoint)
+    (hAck : pipelineAck ep seg = some ep')
+    (hSW : sendWindowInvariant ep)
+    (hCoop : windowNonShrinking ep seg)
+    (hInv : endpointInvariant ep) :
+    sendWindowInvariant ep' := by
+  simp only [pipelineAck] at hAck
+  cases hState : ep.state <;> simp only [hState] at hAck
+  -- Closed, Listen, SynSent: catch-all `| _ => some ep`
+  · simp only [Option.some.injEq] at hAck; rw [← hAck]; exact hSW
+  · simp only [Option.some.injEq] at hAck; rw [← hAck]; exact hSW
+  · simp only [Option.some.injEq] at hAck; rw [← hAck]; exact hSW
+  · -- SynReceived → Established
+    split at hAck
+    · simp only [Option.some.injEq] at hAck; rw [← hAck]
+      simp only [sendWindowInvariant, windowNonShrinking] at *
+      exact hCoop
+    · exact absurd hAck (by simp)
+  · -- Established: future-ACK guard, then ackUpdate
+    split at hAck
+    · exact absurd hAck (by simp)
+    · rename_i hNotFuture
+      simp only [Option.some.injEq] at hAck; rw [← hAck]
+      have hNotFut : ¬ep.tcb.sndNxt.lt seg.ackNum = true := by
+        simp only [Bool.not_eq_true] at hNotFuture; exact Bool.eq_false_iff.mp hNotFuture
+      simp only [sendWindowInvariant, hState] at hSW
+      have hBound : ep.tcb.sndNxt.val - ep.tcb.sndUna.val + 2 < SeqNum.halfSpace := by
+        have := hInv.2.1; simp only [windowInvariant, hState] at this; exact this
+      simp only [sendWindowInvariant, ackUpdate_state, hState]
+      exact ackUpdate_preserves_sendWindow ep seg hSW hCoop hNotFut hBound
+  · -- FinWait1: ackUpdate, then FinWait1 or FinWait2 — neither is Est/CW
+    split at hAck
+    · exact absurd hAck (by simp)
+    · simp only [Option.some.injEq] at hAck; rw [← hAck]
+      -- Output state is if finAcked then FinWait2 else FinWait1
+      simp only [sendWindowInvariant]
+      cases ep.finSeqNum <;> simp <;>
+        (split <;> (first | trivial | (rename_i heq; split at heq <;> simp at heq)))
+  · -- FinWait2: ackUpdate — output stays FinWait2
+    split at hAck
+    · exact absurd hAck (by simp)
+    · simp only [Option.some.injEq] at hAck; rw [← hAck]
+      simp [sendWindowInvariant, ackUpdate_state, hState]
+  · -- CloseWait: future-ACK guard, then ackUpdate
+    split at hAck
+    · exact absurd hAck (by simp)
+    · rename_i hNotFuture
+      simp only [Option.some.injEq] at hAck; rw [← hAck]
+      have hNotFut : ¬ep.tcb.sndNxt.lt seg.ackNum = true := by
+        simp only [Bool.not_eq_true] at hNotFuture; exact Bool.eq_false_iff.mp hNotFuture
+      simp only [sendWindowInvariant, hState] at hSW
+      have hBound : ep.tcb.sndNxt.val - ep.tcb.sndUna.val + 2 < SeqNum.halfSpace := by
+        have := hInv.2.1; simp only [windowInvariant, hState] at this; exact this
+      simp only [sendWindowInvariant, ackUpdate_state, hState]
+      exact ackUpdate_preserves_sendWindow ep seg hSW hCoop hNotFut hBound
+  · -- Closing: ackUpdate, then Closing or TimeWait — neither is Est/CW
+    split at hAck
+    · exact absurd hAck (by simp)
+    · -- split on match ep.finSeqNum
+      split at hAck
+      · -- some fseq: split on if fseq.lt ...
+        split at hAck <;> (simp only [Option.some.injEq] at hAck; rw [← hAck]) <;>
+          simp [sendWindowInvariant, ackUpdate_state, hState]
+      · -- none: if false = true simplifies away
+        simp only [Bool.false_eq_true, ite_false, Option.some.injEq] at hAck; rw [← hAck]
+        simp [sendWindowInvariant, ackUpdate_state, hState]
+  · -- LastAck: match on finSeqNum, then if finAcked
+    split at hAck
+    · -- some fseq
+      split at hAck <;> (simp only [Option.some.injEq] at hAck; rw [← hAck])
+      · exact closedEndpoint_sendWindowInvariant
+      · exact hSW
+    · -- none: if false simplifies to some ep
+      simp only [Bool.false_eq_true, ite_false, Option.some.injEq] at hAck; rw [← hAck]; exact hSW
+  · -- TimeWait
+    simp only [Option.some.injEq] at hAck; rw [← hAck]; exact hSW
+
 private theorem processSegmentSynSent_preserves_sendWindow (ep : TcpEndpoint) (seg : Segment)
-    (hSW : sendWindowInvariant ep) (hCoop : windowNonShrinking ep seg) :
+    (hSW : sendWindowInvariant ep) (hCoop : windowNonShrinking ep seg)
+    (hInv : endpointInvariant ep) (hState : ep.state = .SynSent) :
     sendWindowInvariant (processSegmentSynSent ep seg).endpoint := by
   simp only [processSegmentSynSent]
   -- Split on seg.ctl.ack first to resolve the let-bound ackOk
   cases hAck : seg.ctl.ack
   · -- seg.ctl.ack = false: ackOk = true, so !ackOk = false, enter else branch
-    simp only [hAck, Bool.false_eq_true, ite_false, Bool.not_true]
+    simp only [Bool.false_eq_true, ite_false, Bool.not_true]
     -- RST/SYN/ISS splits
     split -- RST
     · exact hSW
     · split -- SYN
       · split -- ISS < SND.UNA
-        · -- Established path (no ACK, simultaneous open):
-          -- In practice unreachable: requires iss < sndUna but SynSent has sndUna = iss.
-          -- Needs an sndUna=iss invariant (not currently tracked) to derive contradiction.
-          sorry
+        · -- Contradicts issInvariant: in SynSent, sndUna = iss, so lt iss iss is false
+          rename_i _ _ hLt
+          have hIss := hInv.2.2 hState
+          rw [hIss] at hLt
+          exact absurd hLt (by simp [SeqNum.lt_irrefl])
         · simp [sendWindowInvariant]
       · exact hSW
   · -- seg.ctl.ack = true
-    simp only [hAck, Bool.true_eq_false, not_true_eq_false, ite_false, ite_true, Bool.true_and,
-      Bool.not_true]
+    simp only [ite_true, Bool.not_true]
     -- Split: !ackOk?
     split
     · -- bad ACK
@@ -2735,15 +2915,18 @@ private theorem processSegmentSynSent_preserves_sendWindow (ep : TcpEndpoint) (s
       · split
         · split
           · -- Established path (ACK): tcb2 has sndUna=seg.ackNum, sndWnd=seg.window
-            -- windowNonShrinking → ackUpdate bound → this bound
-            sorry
+            -- pipelinePostAck preserves the raw sndNxt/sndUna/sndWnd, so just need
+            -- le sndNxt (seg.ackNum + seg.window), which is windowNonShrinking
+            simp only [windowNonShrinking] at hCoop
+            exact pipelinePostAck_preserves_sendWindowInvariant _ seg hCoop
           · simp [sendWindowInvariant]
         · exact hSW
 
 /-- Segment processing preserves the send window invariant under the
     cooperative peer assumption. -/
 theorem processSegment_preserves_sendWindow (ep : TcpEndpoint) (seg : Segment) (iss : SeqNum)
-    (hSW : sendWindowInvariant ep) (hCoop : windowNonShrinking ep seg) :
+    (hSW : sendWindowInvariant ep) (hCoop : windowNonShrinking ep seg)
+    (hInv : endpointInvariant ep) :
     sendWindowInvariant (processSegment ep seg iss).endpoint := by
   simp only [processSegment]
   split
@@ -2758,9 +2941,55 @@ theorem processSegment_preserves_sendWindow (ep : TcpEndpoint) (seg : Segment) (
         · simp [sendWindowInvariant]
         · exact hSW
   · -- SynSent
-    exact processSegmentSynSent_preserves_sendWindow ep seg hSW hCoop
-  · -- Otherwise: pipeline with ackUpdate
-    sorry
+    rename_i hState
+    exact processSegmentSynSent_preserves_sendWindow ep seg hSW hCoop hInv hState
+  · -- Otherwise: decompose processSegmentOtherwise into pipeline steps
+    simp only [processSegmentOtherwise]
+    -- Split on pipelinePreAck
+    split
+    · -- pipelinePreAck returns some result — early termination
+      rename_i result hPre
+      exact pipelinePreAck_preserves_sendWindow ep seg hSW result hPre
+    · -- pipelinePreAck returns none — continue to pipelineAck
+      -- Split on pipelineAck
+      split
+      · -- pipelineAck returns none — ACK rejected
+        exact pipelineAckReject_preserves_sendWindow ep seg hSW
+      · -- pipelineAck returns some ep' — continue to pipelinePostAck
+        rename_i ep' hAckRes
+        have hSW' := pipelineAck_preserves_sendWindow ep seg ep' hAckRes hSW hCoop hInv
+        have hNotSynRcv := pipelineAck_not_synReceived ep seg ep' hAckRes
+        -- Case split on whether ep' is Est/CW
+        by_cases hEstCW : ep'.state = .Established ∨ ep'.state = .CloseWait
+        · -- Est/CW: extract raw bound from sendWindowInvariant, feed to pipelinePostAck
+          have hRawBound : SeqNum.le ep'.tcb.sndNxt (ep'.tcb.sndUna.add ep'.tcb.sndWnd.toUInt32) = true := by
+            simp only [sendWindowInvariant] at hSW'
+            cases hEstCW with
+            | inl h => rw [h] at hSW'; exact hSW'
+            | inr h => rw [h] at hSW'; exact hSW'
+          exact pipelinePostAck_preserves_sendWindowInvariant ep' seg hRawBound
+        · -- Not Est/CW and not SynReceived: pipelinePostAck can't produce Est/CW
+          have hNotEst : ep'.state ≠ .Established := fun h => hEstCW (Or.inl h)
+          have hNotCW : ep'.state ≠ .CloseWait := fun h => hEstCW (Or.inr h)
+          simp only [sendWindowInvariant]
+          split <;> (try trivial)
+          all_goals (
+            rename_i hOutState; exfalso
+            simp only [pipelinePostAck] at hOutState
+            have hUrg := pipelineUrg_state ep' seg
+            have hText := pipelineText_state (pipelineUrg ep' seg) seg
+            unfold pipelineFin at hOutState; dsimp only [mkSegment] at hOutState
+            split at hOutState
+            · -- FIN: match on state
+              cases hEpSt : ep'.state
+              all_goals (first
+                | exact absurd hEpSt hNotEst | exact absurd hEpSt hNotCW
+                | exact absurd hEpSt hNotSynRcv
+                | (split at hOutState <;> (try (split at hOutState <;> (try (split at hOutState <;> simp_all)) <;> simp_all)) <;> simp_all)
+                | simp_all)
+            · -- no FIN: state preserved
+              split at hOutState <;> simp_all
+          )
 
 -- ============================================================================
 -- System-level theorem
@@ -2778,13 +3007,14 @@ theorem systemStep_preserves_sendWindow (s s' : System)
     (hStep : SystemStep s s')
     (hSWA : sendWindowInvariant s.endpointA) (hSWB : sendWindowInvariant s.endpointB)
     (hCoopA : ∀ seg, seg ∈ s.network → windowNonShrinking s.endpointA seg)
-    (hCoopB : ∀ seg, seg ∈ s.network → windowNonShrinking s.endpointB seg) :
+    (hCoopB : ∀ seg, seg ∈ s.network → windowNonShrinking s.endpointB seg)
+    (hInvA : endpointInvariant s.endpointA) (hInvB : endpointInvariant s.endpointB) :
     sendWindowInvariant s'.endpointA ∧ sendWindowInvariant s'.endpointB := by
   cases hStep with
   | deliverToA seg h_mem result h_proc =>
-    exact ⟨h_proc ▸ processSegment_preserves_sendWindow _ seg _ hSWA (hCoopA seg h_mem), hSWB⟩
+    exact ⟨h_proc ▸ processSegment_preserves_sendWindow _ seg _ hSWA (hCoopA seg h_mem) hInvA, hSWB⟩
   | deliverToB seg h_mem result h_proc =>
-    exact ⟨hSWA, h_proc ▸ processSegment_preserves_sendWindow _ seg _ hSWB (hCoopB seg h_mem)⟩
+    exact ⟨hSWA, h_proc ▸ processSegment_preserves_sendWindow _ seg _ hSWB (hCoopB seg h_mem) hInvB⟩
   | userCallA call result h_proc =>
     exact ⟨h_proc ▸ processUserCall_preserves_sendWindow _ call hSWA, hSWB⟩
   | userCallB call result h_proc =>

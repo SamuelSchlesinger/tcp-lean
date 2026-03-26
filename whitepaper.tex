@@ -392,16 +392,12 @@ assumption (\texttt{windowNonShrinking}) requires that after ACK processing,
 the send window still covers all sent data. This is preserved by every
 \texttt{SystemStep}: user calls and timeouts unconditionally, segment delivery
 under the cooperative assumption.
-Proved as \texttt{systemStep\_preserves\_sendWindow}. The system-level proof
-is structurally complete: user calls, timeouts, and network events
-(loss/duplication) are sorry-free. Three sorry remain in
-segment-processing sub-lemmas for (1)~the SYN-SENT simultaneous-open
-ESTABLISHED path (unreachable in practice; needs a structural
-\texttt{SND.NXT = ISS + 1} invariant), (2)~the SYN-SENT ACK-based
-ESTABLISHED path (connecting the cooperative predicate, defined via
-\texttt{ackUpdate}, to \texttt{pipelineAck}'s direct TCB assignment), and
-(3)~the \texttt{processSegmentOtherwise} pipeline composition (threading the
-cooperative assumption through \texttt{pipelineAck}).
+Proved as \texttt{systemStep\_preserves\_sendWindow} with zero \texttt{sorry}.
+The cooperative predicate (\texttt{windowNonShrinking}) requires that the
+peer's advertised right edge ($\texttt{SEG.ACK} + \texttt{SEG.WND}$) covers
+all sent data ($\texttt{SND.NXT}$). Preservation is unconditional for user
+calls, timeouts, and network events; segment delivery requires the
+cooperative assumption.
 \end{theorem}
 
 \section{Conclusion}
@@ -410,9 +406,8 @@ cooperative assumption through \texttt{pipelineAck}).
 We have presented a machine-checked formalization of TCP (RFC~793) in Lean~4,
 covering modular sequence number arithmetic, the full event-processing state
 machine, segment acceptability, connection establishment, graceful teardown,
-and safety invariants. All core proofs (Phases~1--3) compile with zero
-\texttt{sorry}; the cooperative send window invariant has three remaining
-sorry in segment-processing sub-lemmas.
+and safety invariants including a cooperative send window bound (RFC~1122
+\S4.2.2.16). All proofs compile with zero \texttt{sorry}.
 
 \subsection{Design Decisions}
 
